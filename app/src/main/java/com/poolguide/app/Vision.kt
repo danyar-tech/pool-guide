@@ -19,7 +19,6 @@ import kotlin.math.sqrt
 /** Felt colour in OpenCV HSV (H 0..180, S/V 0..255) plus RGB for low-saturation felts. */
 data class Felt(val h: Int, val s: Int, val v: Int, val r: Int, val g: Int, val b: Int)
 
-data class BallDetection(val balls: List<Ball>, val radius: Double)
 
 /**
  * Computer vision for top-down pool games:
