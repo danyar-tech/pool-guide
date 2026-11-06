@@ -42,6 +42,26 @@ class Prefs(ctx: Context) {
         get() = sp.getFloat("ballRadius", 0f)
         set(v) = sp.edit().putFloat("ballRadius", v).apply()
 
+    /** Table found automatically (off = the player sets it by hand, the default). */
+    var autoTable: Boolean
+        get() = sp.getBoolean("autoTable", false)
+        set(v) = sp.edit().putBoolean("autoTable", v).apply()
+
+    /** Cue ball position set by hand instead of detected. */
+    var cueManual: Boolean
+        get() = sp.getBoolean("cueManual", false)
+        set(v) = sp.edit().putBoolean("cueManual", v).apply()
+
+    /** PREDICT: trace the shot for the current stick direction. BEST: suggest the easiest pot. */
+    var predictMode: Boolean
+        get() = sp.getBoolean("predict", false)
+        set(v) = sp.edit().putBoolean("predict", v).apply()
+
+    /** Stick direction set by hand instead of read from the game's cue stick / aim line. */
+    var stickManual: Boolean
+        get() = sp.getBoolean("stickManual", false)
+        set(v) = sp.edit().putBoolean("stickManual", v).apply()
+
     var lockTable: Boolean
         get() = sp.getBoolean("lockTable", false)
         set(v) = sp.edit().putBoolean("lockTable", v).apply()
@@ -91,8 +111,19 @@ class GuideState {
     var forcedPocket: Int = -1
     /** True after manual ball edits: live scanning stops overwriting the balls until the next Scan. */
     var ballsManual: Boolean = false
-    var message: String = "Tap Scan to detect the table"
+    var message: String = "Set up the table: tap Edit"
     var nextId: Int = 1000
+    /** Cue ball position placed by hand (used when cue mode is manual). */
+    var manualCue: Vec? = null
+    /** Stick direction set by hand (radians). */
+    var manualAngle: Double? = null
+    /** Stick direction read from the screen (radians), smoothed. */
+    var detectedAngle: Double? = null
+    var detectedFromStick: Boolean = true
+    var prediction: Prediction? = null
+
+    /** The direction Predict mode uses right now. */
+    fun aimAngle(stickManual: Boolean): Double? = if (stickManual) manualAngle ?: detectedAngle else detectedAngle
 
     val currentShot: Shot? get() = shots.getOrNull(shotIndex)
 

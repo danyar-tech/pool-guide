@@ -55,6 +55,9 @@ class OverlayService : Service() {
     private var dpi = 0
 
     private val vision = Vision()
+    private val ballVision = BallVision()
+    private val tracker = Tracker()
+    private var stickMisses = 0
     private val state = GuideState()
     private var aim: AimView? = null
     private var aimParams: WindowManager.LayoutParams? = null
@@ -66,7 +69,6 @@ class OverlayService : Service() {
     private var lastFrame: ByteArray? = null
     private var lastFrameW = 0
     private var lastFrameH = 0
-    private var stableFrames = 0
     private var cvReady = false
 
     // ------------------------------------------------------------------ lifecycle
@@ -109,6 +111,7 @@ class OverlayService : Service() {
         setupCapture()
         if (aim == null) setupOverlays()
         loadTable()
+        if (state.table == null && !prefs.autoTable) main.postDelayed({ setEditing(true) }, 300)
         main.removeCallbacks(liveLoop)
         main.postDelayed(liveLoop, 600)
         return START_NOT_STICKY
@@ -192,13 +195,15 @@ class OverlayService : Service() {
 
     private val liveLoop = object : Runnable {
         override fun run() {
-            if (live && !editing && !busy) capture(detectTable = state.table == null)
-            main.postDelayed(this, prefs.liveInterval.toLong().coerceAtLeast(250))
+            val canScan = state.table != null || prefs.autoTable
+            if (live && !editing && !busy && canScan) capture(detectTable = state.table == null)
+            val interval = prefs.liveInterval.toLong().coerceAtLeast(250)
+            main.postDelayed(this, if (prefs.predictMode) minOf(interval, 450L) else interval)
         }
     }
 
     /** Hide the guide lines, grab a clean frame, show them again, then analyse off the main thread. */
-    private fun capture(detectTable: Boolean, single: Boolean = false) {
+    private fun capture(detectTable: Boolean, single: Boolean = false, autoSize: Boolean = false) {
         if (reader == null || busy) return
         busy = true
         val a = aim
@@ -233,7 +238,18 @@ class OverlayService : Service() {
                 }
                 val fw = if (bytes != null) w else lastFrameW
                 val fh = if (bytes != null) h else lastFrameH
-                worker.post { analyse(frame, fw, fh, detectTable, single) }
+                val job = Job(
+                    table = state.table?.copyDeep(),
+                    detectTable = detectTable && prefs.autoTable || (detectTable && single && state.table == null),
+                    forceTable = detectTable && single && prefs.autoTable,
+                    radius = if (prefs.ballRadius > 0) prefs.ballRadius.toDouble() else state.radius,
+                    autoSize = autoSize,
+                    manualBalls = state.ballsManual,
+                    cue = if (prefs.cueManual) state.manualCue else null,
+                    wantStick = prefs.predictMode && !prefs.stickManual,
+                    single = single,
+                )
+                worker.post { analyse(frame, fw, fh, job) }
             }
         }
         main.postDelayed(grab, if (hide) 90L else 10L)
@@ -254,91 +270,130 @@ class OverlayService : Service() {
 
     // ------------------------------------------------------------------ analysis (worker thread)
 
-    private fun analyse(frame: ByteArray, w: Int, h: Int, detectTable: Boolean, single: Boolean) {
-        var table: TableGeom? = null
+    /** Snapshot of everything the worker needs, taken on the main thread. */
+    private class Job(
+        val table: TableGeom?, val detectTable: Boolean, val forceTable: Boolean, val radius: Double,
+        val autoSize: Boolean, val manualBalls: Boolean, val cue: Vec?, val wantStick: Boolean, val single: Boolean,
+    )
+
+    private class Result(
+        val table: TableGeom?, val tableDetected: Boolean, val balls: List<Ball>?, val radius: Double,
+        val radiusEstimated: Boolean, val stick: StickReading?, val stickTried: Boolean, val msg: String?,
+    )
+
+    private fun analyse(frame: ByteArray, w: Int, h: Int, job: Job) {
+        var table = job.table
+        var tableDetected = false
         var balls: List<Ball>? = null
-        var radius = 0.0
+        var radius = job.radius
+        var estimated = false
+        var stick: StickReading? = null
         var msg: String? = null
         try {
-            if (cvReady) {
-                val mat = Mat(h, w, CvType.CV_8UC4)
-                mat.put(0, 0, frame)
-                val current = runOnMainSync { state.table?.copyDeep() }
-                table = current
-                if (table == null || (detectTable && !prefs.lockTable)) {
-                    val t = vision.detectTable(mat)
-                    if (t != null) table = t else if (table == null) msg = "Table not found — use Edit → drag the blue handles"
-                }
-                val manual = runOnMainSync { state.ballsManual }
-                if (table != null && !manual) {
-                    val hint = runOnMainSync { state.radius }
-                    val det = vision.detectBalls(mat, table, prefs.ballRadius.toDouble(), hint)
-                    if (det != null) { balls = det.balls; radius = det.radius }
-                }
-                mat.release()
+            if (!cvReady) throw IllegalStateException("OpenCV not loaded")
+            val mat = Mat(h, w, CvType.CV_8UC4)
+            mat.put(0, 0, frame)
+            if (table == null || job.forceTable || (job.detectTable && !prefs.lockTable)) {
+                val t = vision.detectTable(mat)
+                if (t != null) { table = t; tableDetected = true }
+                else if (table == null) msg = "Table not found — tap Edit and drag the blue dots"
             }
+            if (table != null) {
+                if (radius <= 0 || job.autoSize) {
+                    val est = ballVision.estimateRadius(mat, table)
+                    if (est != null) { radius = est; estimated = true }
+                    else if (radius <= 0) radius = table.longSide / 55
+                }
+                val prep = ballVision.prepare(mat, table, radius)
+                if (prep != null) {
+                    if (!job.manualBalls) balls = ballVision.detectIn(prep, table, radius).balls
+                    if (job.wantStick) {
+                        val cue = job.cue ?: balls?.firstOrNull { it.kind == BallKind.CUE }?.pos
+                        if (cue != null) stick = ballVision.detectStick(prep, cue)
+                    }
+                }
+            }
+            mat.release()
         } catch (e: Throwable) {
             msg = "Detection error: ${e.message}"
         }
-        val newTable = table
-        val newBalls = balls
-        val newRadius = radius
-        val tableChanged = detectTable
-        main.post { applyResult(newTable, newBalls, newRadius, msg, single, tableChanged) }
+        val res = Result(table, tableDetected, balls, radius, estimated, stick, job.wantStick, msg)
+        main.post { applyResult(res, job.single) }
     }
 
-    private fun <T> runOnMainSync(block: () -> T): T {
-        if (Looper.myLooper() == Looper.getMainLooper()) return block()
-        val lock = Object()
-        var result: Any? = null
-        var done = false
-        main.post {
-            result = block()
-            synchronized(lock) { done = true; lock.notifyAll() }
-        }
-        synchronized(lock) { while (!done) lock.wait(500) }
-        @Suppress("UNCHECKED_CAST") return result as T
-    }
-
-    private fun applyResult(table: TableGeom?, balls: List<Ball>?, radius: Double, msg: String?, single: Boolean, detectedTable: Boolean) {
+    private fun applyResult(res: Result, single: Boolean) {
         busy = false
         if (aim == null) return
-        if (table != null) {
-            val wasNull = state.table == null
-            state.table = table
-            if (wasNull || detectedTable) prefs.saveTable(screenW, screenH, table)
+        if (res.table != null && (state.table == null || res.tableDetected)) {
+            state.table = res.table
+            prefs.saveTable(screenW, screenH, res.table)
         }
-        if (balls != null && !state.ballsManual) {
-            val moved = ballsMoved(state.balls, balls, radius)
-            state.balls = balls.toMutableList()
-            state.radius = if (prefs.ballRadius > 0) prefs.ballRadius.toDouble() else radius
-            if (moved && !single) { stableFrames = 0 } else stableFrames++
-            state.moving = stableFrames < 1 && !single
-            if (moved) state.shotIndex = 0
+        if (res.radius > 0) {
+            state.radius = res.radius
+            if (res.radiusEstimated && prefs.ballRadius <= 0f) toast("Ball size set automatically — adjust the orange ring in Edit if it looks wrong")
         }
-        if (msg != null) state.message = msg
+        if (res.balls != null && !state.ballsManual) {
+            if (single) tracker.reset()
+            state.balls = tracker.update(res.balls, state.radius).toMutableList()
+            state.moving = tracker.moving && !single
+        }
+        if (res.stickTried) {
+            val s = res.stick
+            if (s != null) {
+                val prev = state.detectedAngle
+                val diff = if (prev == null) 9.0 else kotlin.math.abs(angleDiff(prev, s.angle))
+                state.detectedAngle = if (prev != null && diff < Math.toRadians(0.4)) prev + angleDiff(s.angle, prev) * 0.5 else s.angle
+                state.detectedFromStick = s.fromStick
+                stickMisses = 0
+            } else if (++stickMisses > 2) {
+                state.detectedAngle = null
+            }
+        }
+        if (res.msg != null) state.message = res.msg
         replan(keepIndex = true)
     }
 
-    private fun ballsMoved(old: List<Ball>, new: List<Ball>, r: Double): Boolean {
-        if (old.size != new.size) return true
-        val tol = r * 0.35
-        return new.any { n -> old.minOfOrNull { it.pos.dist(n.pos) }?.let { it > tol } ?: true }
+    /** Signed smallest difference a - b in radians. */
+    private fun angleDiff(a: Double, b: Double): Double {
+        var d = (a - b) % (2 * Math.PI)
+        if (d > Math.PI) d -= 2 * Math.PI
+        if (d < -Math.PI) d += 2 * Math.PI
+        return d
+    }
+
+    /** Balls used for planning: the detected ones, with the hand-placed cue ball swapped in when cue mode is manual. */
+    private fun planningBalls(): List<Ball> {
+        val m = state.manualCue
+        if (!prefs.cueManual || m == null) return state.balls
+        val r = state.radius
+        val rest = state.balls.filter { it.kind != BallKind.CUE && it.pos.dist(m) > r * 1.2 }
+        return rest + Ball(-7, m, BallKind.CUE)
     }
 
     private fun replan(keepIndex: Boolean = false) {
         val t = state.table
-        val cue = state.balls.firstOrNull { it.kind == BallKind.CUE }
-        state.shots = if (t != null && cue != null && state.radius > 0) {
-            Planner(prefs.plannerConfig(state.forcedTargetId(), state.forcedPocket))
-                .plan(Scene(t, state.balls, state.radius))
-        } else emptyList()
-        if (!keepIndex || state.shotIndex >= state.shots.size) state.shotIndex = 0
-        if (state.shots.isEmpty()) {
+        val balls = planningBalls()
+        val cue = balls.firstOrNull { it.kind == BallKind.CUE }
+        val cfg = prefs.plannerConfig(state.forcedTargetId(), state.forcedPocket)
+        state.prediction = null
+        if (prefs.predictMode) {
+            state.shots = emptyList()
+            val ang = state.aimAngle(prefs.stickManual)
+            if (t != null && cue != null && ang != null && state.radius > 0) {
+                state.prediction = Predictor(cfg).predict(Scene(t, balls, state.radius), cue.id, cue.pos,
+                    Vec(kotlin.math.cos(ang), kotlin.math.sin(ang)))
+            }
+        } else {
+            state.shots = if (t != null && cue != null && state.radius > 0) {
+                Planner(cfg).plan(Scene(t, balls, state.radius))
+            } else emptyList()
+            if (!keepIndex || state.shotIndex >= state.shots.size) state.shotIndex = 0
+        }
+        if (t != null && (state.shots.isEmpty() || prefs.predictMode)) {
             state.message = when {
-                t == null -> state.message
-                state.balls.isEmpty() -> "No balls found — tap Scan, or Edit → Add"
-                cue == null -> "Cue ball not found — Edit → Set cue"
+                balls.isEmpty() -> "No balls found — tap Scan, or Edit → Add"
+                cue == null -> "Cue ball not found — Edit → Mark cue, or Cue: Man"
+                prefs.predictMode -> "Waiting for the stick…"
                 else -> "No clear pot — play safe (or allow banks/kicks in settings)"
             }
         }
@@ -363,7 +418,10 @@ class OverlayService : Service() {
         val view = AimView(this, state,
             onBallsEdited = { state.ballsManual = true; state.moving = false; replan() },
             onTableEdited = { state.table?.let { prefs.saveTable(screenW, screenH, it) }; replan() },
-            onSelectionChanged = { replan() })
+            onSelectionChanged = { replan() },
+            onRadiusEdited = { r -> prefs.ballRadius = r.toFloat(); replan() },
+            onCueEdited = { if (!prefs.cueManual) prefs.cueManual = true; replan() },
+            onAimEdited = { if (!prefs.stickManual) prefs.stickManual = true; replan() })
         wm.addView(view, ap)
         aim = view; aimParams = ap
 
@@ -389,17 +447,14 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
 
     private fun wirePanel(p: ControlPanel, pp: WindowManager.LayoutParams) {
-        p.btnLive.setOnClickListener {
-            live = !live
-            if (live) stableFrames = 0
-            updatePanel()
-        }
+        p.btnLive.setOnClickListener { live = !live; updatePanel() }
         p.btnScan.setOnClickListener {
             state.ballsManual = false
             state.forcedTargetPos = null
             state.forcedPocket = -1
             capture(detectTable = true, single = true)
         }
+        p.btnMode.setOnClickListener { prefs.predictMode = !prefs.predictMode; replan() }
         p.btnNext.setOnClickListener {
             if (state.shots.isNotEmpty()) state.shotIndex = (state.shotIndex + 1) % state.shots.size
             aim?.invalidate(); updatePanel()
@@ -408,6 +463,32 @@ class OverlayService : Service() {
             prefs.group = when (prefs.group) { Group.ANY -> Group.SOLIDS; Group.SOLIDS -> Group.STRIPES; Group.STRIPES -> Group.ANY }
             replan()
         }
+        p.btnCue.setOnClickListener {
+            prefs.cueManual = !prefs.cueManual
+            if (prefs.cueManual) {
+                if (state.manualCue == null) {
+                    state.manualCue = state.balls.firstOrNull { it.kind == BallKind.CUE }?.pos ?: state.table?.center
+                }
+                setEditing(true)
+                aim?.tool = EditTool.PLACE_CUE
+                updatePanel()
+            }
+            replan()
+        }
+        p.btnStick.setOnClickListener {
+            prefs.stickManual = !prefs.stickManual
+            if (prefs.stickManual && state.manualAngle == null) state.manualAngle = state.detectedAngle ?: 0.0
+            replan()
+        }
+        // Fine aim: 0.05 degree per tap, faster when held.
+        fun rotate(sign: Int, count: Int) {
+            val stepDeg = if (count < 6) 0.05 else if (count < 25) 0.25 else 1.0
+            val base = state.manualAngle ?: state.detectedAngle ?: 0.0
+            state.manualAngle = base + sign * Math.toRadians(stepDeg)
+            replan()
+        }
+        p.setRepeat(p.btnRotL) { rotate(-1, it) }
+        p.setRepeat(p.btnRotR) { rotate(1, it) }
         p.btnEdit.setOnClickListener { setEditing(true) }
         p.btnHide.setOnClickListener {
             aim?.let { it.guidesVisible = !it.guidesVisible }
@@ -417,22 +498,24 @@ class OverlayService : Service() {
             prefs.sp.edit().putInt("panelX", pp.x).putInt("panelY", pp.y).apply()
             stopSelf()
         }
-        p.toolButtons.forEach { (tool, b) ->
-            b.setOnClickListener { aim?.tool = tool; updatePanel() }
-        }
+        p.toolButtons.forEach { (tool, b) -> b.setOnClickListener { aim?.tool = tool; updatePanel() } }
         p.btnRedetect.setOnClickListener {
-            prefs.lockTable = false
-            state.table = null
+            prefs.autoTable = true
             setEditing(false)
             capture(detectTable = true, single = true)
+            toast("Finding the table automatically… (turn this off again in settings to keep it manual)")
         }
-        p.btnClear.setOnClickListener {
-            state.forcedTargetPos = null; state.forcedPocket = -1; replan()
+        p.btnAutoSize.setOnClickListener {
+            prefs.ballRadius = 0f
+            setEditing(false)
+            capture(detectTable = false, single = true, autoSize = true)
         }
+        p.btnClear.setOnClickListener { state.forcedTargetPos = null; state.forcedPocket = -1; replan() }
         p.btnDone.setOnClickListener {
             state.table?.let { prefs.saveTable(screenW, screenH, it) }
             prefs.sp.edit().putInt("panelX", pp.x).putInt("panelY", pp.y).apply()
             setEditing(false)
+            if (!state.ballsManual) capture(detectTable = false, single = true)
         }
     }
 
@@ -446,7 +529,7 @@ class OverlayService : Service() {
             ap.flags = ap.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
             ap.alpha = 1f
             if (state.table == null) {
-                // Give the player a starting rectangle to drag into place.
+                // A starting rectangle for the player to drag onto the cushions.
                 val t = TableGeom(screenW * 0.12, screenH * 0.2, screenW * 0.88, screenH * 0.8)
                 t.resetPockets()
                 state.table = t
@@ -464,7 +547,12 @@ class OverlayService : Service() {
         val p = panel ?: return
         p.setActive(p.btnLive, live)
         p.btnLive.text = if (live) "Live ●" else "Live ○"
+        p.setModeButtons(prefs.predictMode, prefs.stickManual)
+        p.setActive(p.btnMode, prefs.predictMode)
         p.btnGroup.text = when (prefs.group) { Group.ANY -> "Any"; Group.SOLIDS -> "Solids"; Group.STRIPES -> "Stripes" }
+        p.btnCue.text = if (prefs.cueManual) "Cue: Man" else "Cue: Auto"
+        p.setActive(p.btnCue, prefs.cueManual)
+        p.setActive(p.btnStick, prefs.stickManual)
         p.btnHide.text = if (aim?.guidesVisible == false) "Show" else "Hide"
         p.toolButtons.forEach { (tool, b) -> p.setActive(b, aim?.tool == tool) }
         val n = state.balls.size
@@ -478,6 +566,7 @@ class OverlayService : Service() {
 
     private fun loadTable() {
         prefs.table(screenW, screenH)?.let { state.table = it }
+        if (prefs.ballRadius > 0) state.radius = prefs.ballRadius.toDouble()
         aim?.invalidate()
     }
 

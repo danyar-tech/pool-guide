@@ -31,14 +31,20 @@ class ControlPanel(
 
     val btnLive = button("Live")
     val btnScan = button("Scan")
+    val btnMode = button("Best")
     val btnNext = button("Next")
+    val btnCue = button("Cue: Auto")
+    val btnStick = button("Stick: Auto")
+    val btnRotL = button("◀")
+    val btnRotR = button("▶")
     val btnGroup = button("Any")
     val btnEdit = button("Edit")
     val btnHide = button("Hide")
     val btnStop = button("✕")
 
     val toolButtons = EditTool.values().associateWith { button(it.label) }
-    val btnRedetect = button("Find table")
+    val btnRedetect = button("Auto table")
+    val btnAutoSize = button("Auto size")
     val btnClear = button("Clear pick")
     val btnDone = button("Done")
 
@@ -65,10 +71,11 @@ class ControlPanel(
         addView(top)
 
         normalRow.orientation = HORIZONTAL
-        listOf(btnLive, btnScan, btnNext, btnGroup, btnEdit, btnHide, btnStop).forEach { normalRow.addView(it) }
+        listOf(btnLive, btnScan, btnMode, btnNext, btnGroup, btnCue, btnStick, btnRotL, btnRotR, btnEdit, btnHide, btnStop)
+            .forEach { normalRow.addView(it) }
         editRow.orientation = HORIZONTAL
         toolButtons.values.forEach { editRow.addView(it) }
-        listOf(btnRedetect, btnClear, btnDone).forEach { editRow.addView(it) }
+        listOf(btnAutoSize, btnRedetect, btnClear, btnDone).forEach { editRow.addView(it) }
         editRow.visibility = GONE
 
         rows.orientation = VERTICAL
@@ -100,6 +107,34 @@ class ControlPanel(
         (b.background as GradientDrawable).setColor(
             if (active) Color.argb(230, 255, 214, 0) else Color.argb(70, 255, 255, 255))
         b.setTextColor(if (active) Color.BLACK else Color.WHITE)
+    }
+
+    /** Show only the buttons that make sense for the current mode. */
+    fun setModeButtons(predict: Boolean, stickManual: Boolean) {
+        btnMode.text = if (predict) "Predict" else "Best shot"
+        btnNext.visibility = if (predict) GONE else VISIBLE
+        btnGroup.visibility = if (predict) GONE else VISIBLE
+        btnStick.visibility = if (predict) VISIBLE else GONE
+        btnStick.text = if (stickManual) "Stick: Man" else "Stick: Auto"
+        btnRotL.visibility = if (predict && stickManual) VISIBLE else GONE
+        btnRotR.visibility = if (predict && stickManual) VISIBLE else GONE
+    }
+
+    /** Repeats [step] while the button is held, speeding up: fine aiming with ◀ ▶. */
+    @SuppressLint("ClickableViewAccessibility")
+    fun setRepeat(b: TextView, step: (Int) -> Unit) {
+        val h = android.os.Handler(android.os.Looper.getMainLooper())
+        var count = 0
+        val r = object : Runnable {
+            override fun run() { count++; step(count); h.postDelayed(this, if (count < 6) 120L else 40L) }
+        }
+        b.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { count = 0; step(0); h.postDelayed(r, 350) }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> h.removeCallbacks(r)
+            }
+            true
+        }
     }
 
     fun showEdit(edit: Boolean) {

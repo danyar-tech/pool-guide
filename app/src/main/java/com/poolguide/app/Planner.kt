@@ -337,7 +337,7 @@ class Planner(private val cfg: PlannerConfig) {
     }
 
     /** Friction model: deceleration a = 1, so v^2 = 2 * distance. Returns object ball start speed. */
-    private fun objectStartSpeed(scene: Scene, legs: List<Double>): Double {
+    fun objectStartSpeed(scene: Scene, legs: List<Double>): Double {
         val extra = cfg.firmnessTables * scene.table.longSide
         // Work backwards from the pocket: last leg plus the extra roll, then each rail costs speed.
         var v2 = 2 * (legs.last() + extra)
@@ -347,7 +347,7 @@ class Planner(private val cfg: PlannerConfig) {
         return safeSqrt(v2)
     }
 
-    private fun cueStartPower(scene: Scene, cueLegs: List<Double>, vObj: Double, cut: Double): Double {
+    fun cueStartPower(scene: Scene, cueLegs: List<Double>, vObj: Double, cut: Double): Double {
         val c = max(cos(cut), 0.12)
         val vContact = vObj / (c * cfg.ballRestitution)
         var v2 = sq(vContact) + 2 * cueLegs.last()

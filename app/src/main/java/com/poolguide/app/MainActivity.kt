@@ -121,6 +121,13 @@ class MainActivity : Activity() {
         root.addView(text("When Android asks what to share, choose \"Entire screen\". " +
             "Then open your game and tap Scan on the floating panel.", 13f, dim = true))
 
+        root.addView(header("Mode"))
+        root.addView(check("Predict mode: trace the shot for the current stick direction (off = suggest the best shot)",
+            prefs.predictMode) { prefs.predictMode = it })
+        root.addView(check("Set the stick direction by hand (off = read it from the game's cue stick / aim line)",
+            prefs.stickManual) { prefs.stickManual = it })
+        root.addView(check("Place the cue ball by hand (off = detect it)", prefs.cueManual) { prefs.cueManual = it })
+
         root.addView(header("Shot selection"))
         val groups = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
         Group.values().forEach { g ->
@@ -160,7 +167,10 @@ class MainActivity : Activity() {
         root.addView(slider("Live scan every %.0f ms", 250, 2000, prefs.liveInterval) { v ->
             prefs.liveInterval = v; v.toFloat()
         })
-        root.addView(slider("Ball radius: %.0f px (0 = automatic)", 0, 80, prefs.ballRadius.toInt()) { v ->
+        root.addView(check("Find the table automatically (off = you set it by hand in Edit — recommended)", prefs.autoTable) {
+            prefs.autoTable = it
+        })
+        root.addView(slider("Ball radius: %.0f px (0 = automatic; easier: orange ring in Edit)", 0, 80, prefs.ballRadius.toInt()) { v ->
             prefs.ballRadius = v.toFloat(); v.toFloat()
         })
         root.addView(check("Lock table position (stop re-detecting it on Scan)", prefs.lockTable) { prefs.lockTable = it })
@@ -174,17 +184,23 @@ class MainActivity : Activity() {
 
         root.addView(header("Floating panel"))
         root.addView(text(
+            "First time: the guide opens in Edit. Drag the 8 blue dots onto the inner edges of the cushions, " +
+            "drag the orange ring onto a ball and drag its orange dot to the ball's edge, then tap Done.\n\n" +
             "Live — keep scanning automatically\n" +
-            "Scan — detect table + balls now\n" +
-            "Next — cycle through other good shots\n" +
+            "Scan — detect the balls now\n" +
+            "Best shot / Predict — suggest the easiest pot, or trace the shot your stick is aiming at\n" +
+            "Next — cycle through other good shots (Best shot mode)\n" +
             "Any/Solids/Stripes — which balls are yours\n" +
-            "Edit — fix detection by hand: drag balls, pockets or the blue table handles, add/delete balls, " +
-            "set the cue ball, change a ball's type, or tap a ball/pocket to force that shot\n" +
+            "Cue: Auto/Man — detect the cue ball or place it yourself (Edit → Place cue)\n" +
+            "Stick: Auto/Man — read the stick direction from the game, or set it yourself " +
+            "(Edit → Aim to drag it, ◀ ▶ to fine-tune: tap = 0.05°, hold = faster)\n" +
+            "Edit — set the table and ball size, drag/add/delete balls, mark the cue ball, change a ball's type, " +
+            "or tap a ball/pocket to force that shot\n" +
             "Hide — hide the lines\n" +
             "Tap the ⠿ title to collapse the panel, drag it to move it. Keep it off the table.\n\n" +
             "On screen: white line = cue ball path, dashed circle = where the cue ball must be at contact " +
             "(ghost ball), yellow line = object ball path, blue dots = where the cue ball goes after contact, " +
-            "red dot = cushion contact point.", 13f, dim = true))
+            "red dot = cushion contact point. In Predict mode the object ball line turns green when it goes in.", 13f, dim = true))
 
         return ScrollView(this).apply { addView(root); setBackgroundColor(Color.rgb(16, 20, 24)) }
     }
