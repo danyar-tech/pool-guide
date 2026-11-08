@@ -242,6 +242,26 @@ def make_scene(seed, w=2400, h=1080):
                              (int(gx + math.cos(a2) * (r + L2)), int(gy + math.sin(a2) * (r + L2))), col, lw, cv2.LINE_AA)
         alpha = rng.uniform(0.55, 1.0)
         img = cv2.addWeighted(img, 1 - alpha, over, alpha, 0)
+        if rng.random() < 0.5:
+            # "outlined" style (white core with a dark border, ~1/3 ball radius wide), as in many 8-ball games
+            INFO['outlined'] = True
+            core = max(2, int(r * 0.17)); border = core + max(2, int(r * 0.14))
+            ghost = (cx + dx * Lg, cy + dy * Lg)
+            segs = [((cx, cy), ghost)]
+            # cue ball deflection line from the ghost centre, object line from a nearby ball centre
+            a2 = ang + rng.choice([1, -1]) * math.pi / 2
+            segs.append((ghost, (ghost[0] + math.cos(a2) * r * rng.uniform(2, 5), ghost[1] + math.sin(a2) * r * rng.uniform(2, 5))))
+            others = [p for p in placed if p[2] != 0]
+            near = min(others, key=lambda p: math.hypot(p[0] - ghost[0], p[1] - ghost[1])) if others else None
+            if near and math.hypot(near[0] - ghost[0], near[1] - ghost[1]) < 4 * r:
+                od = math.atan2(near[1] - ghost[1], near[0] - ghost[0])
+                segs.append(((near[0], near[1]), (near[0] + math.cos(od) * r * rng.uniform(3, 8), near[1] + math.sin(od) * r * rng.uniform(3, 8))))
+            for col_, wdt in (((15, 25, 35), border), ((250, 250, 250), core)):
+                for (a, b) in segs:
+                    cv2.line(img, (int(a[0]), int(a[1])), (int(b[0]), int(b[1])), col_, wdt, cv2.LINE_AA)
+                cv2.circle(img, (int(ghost[0]), int(ghost[1])), int(r * 0.95), col_, wdt, cv2.LINE_AA)
+            # the cue line starts at the cue ball centre: redraw the cue ball over it
+            shade_disk(img, cx, cy, r, (245, 245, 240), outline=outline)
         INFO['line_w'] = lw; INFO['style'] = style; INFO['stick'] = False
         if rng.random() < 0.85:
             INFO['stick'] = True

@@ -43,6 +43,8 @@ class BallVision {
         val Lbg: FloatArray, val D: FloatArray,
         val gx: FloatArray, val gy: FloatArray,
         val gxx: FloatArray, val gxy: FloatArray, val gyy: FloatArray,
+        /** Pixels of the game's own guide lines (thin, bright, long) incl. their border. */
+        val guide: BooleanArray,
     ) {
         fun toScreen(x: Double, y: Double) = Vec(x0 + x / s, y0 + y / s)
         fun toLocal(p: Vec) = Vec((p.x - x0) * s, (p.y - y0) * s)
@@ -190,7 +192,33 @@ class BallVision {
             gyy[i] = fy[i] * fy[i] + wl * (gyL[i] * gyL[i] + gyA[i] * gyA[i] + gyB[i] * gyB[i])
             gxy[i] = fx[i] * fy[i] + wl * (gxL[i] * gyL[i] + gxA[i] * gyA[i] + gxB[i] * gyB[i])
         }
-        return Prep(x0, y0, s, w, h, L, A, B, Lbg, D, gx, gy, gxx, gxy, gyy)
+        return Prep(x0, y0, s, w, h, L, A, B, Lbg, D, gx, gy, gxx, gxy, gyy, guideMask(L, A, B, w, h))
+    }
+
+    /** The game's own guide lines: thin, bright and LONG (stripe caps and highlights are short). */
+    private fun guideMask(L: FloatArray, A: FloatArray, B: FloatArray, w: Int, h: Int): BooleanArray {
+        val n = w * h
+        val bright = ByteArray(n) { if (L[it] > 150f && sqrt(A[it] * A[it] + B[it] * B[it]) < 30f) 1 else 0 }
+        val bm = Mat(h, w, CvType.CV_8UC1); bm.put(0, 0, bright)
+        val k5 = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(5.0, 5.0))
+        val opened = Mat(); Imgproc.morphologyEx(bm, opened, Imgproc.MORPH_OPEN, k5)
+        val ob = ByteArray(n); opened.get(0, 0, ob)
+        val thin = ByteArray(n) { if (bright[it].toInt() != 0 && ob[it].toInt() == 0) 1 else 0 }
+        val tm = Mat(h, w, CvType.CV_8UC1); tm.put(0, 0, thin)
+        val labels = Mat(); val stats = Mat(); val cents = Mat()
+        val nl = Imgproc.connectedComponentsWithStats(tm, labels, stats, cents, 8, CvType.CV_32S)
+        val keep = BooleanArray(nl)
+        for (i in 1 until nl) {
+            val cw = stats.get(i, Imgproc.CC_STAT_WIDTH)[0]; val ch = stats.get(i, Imgproc.CC_STAT_HEIGHT)[0]
+            if (max(cw, ch) >= 2.2 * TARGET_R) keep[i] = true
+        }
+        val lab = IntArray(n); labels.get(0, 0, lab)
+        val g = ByteArray(n) { if (keep[lab[it]]) 1 else 0 }
+        val gm = Mat(h, w, CvType.CV_8UC1); gm.put(0, 0, g)
+        val gd = Mat(); Imgproc.dilate(gm, gd, k5)
+        val out = ByteArray(n); gd.get(0, 0, out)
+        listOf(bm, opened, tm, labels, stats, cents, gm, gd, k5).forEach { it.release() }
+        return BooleanArray(n) { out[it].toInt() != 0 }
     }
 
     // ------------------------------------------------------------------ balls
@@ -292,6 +320,23 @@ class BallVision {
      * felt-coloured, outlines and logo rings are hollow and low-contrast. Real balls are shaded and solid.
      */
     private fun isFake(p: Prep, cx: Double, cy: Double, R: Double): Boolean {
+        // The game's ghost ball: a bright white outline at ball radius with a non-white (felt) inside.
+        var nRing = 0; var whiteRing = 0; var nIn6 = 0; var whiteIn6 = 0; var nIn7 = 0; var feltIn7 = 0
+        for (y in max(0, (cy - 1.2 * R).toInt()) until min(p.h, (cy + 1.2 * R).toInt() + 1))
+            for (x in max(0, (cx - 1.2 * R).toInt()) until min(p.w, (cx + 1.2 * R).toInt() + 1)) {
+                val d = sqrt(sq(x - cx) + sq(y - cy)) / R
+                val i = y * p.w + x
+                val white = p.L[i] > 190f && sqrt(p.A[i] * p.A[i] + p.B[i] * p.B[i]) < 30f
+                if (d > 0.8 && d <= 1.15) { nRing++; if (white) whiteRing++ }
+                if (d <= 0.6) { nIn6++; if (white) whiteIn6++ }
+                if (d <= 0.7) { nIn7++; if (p.D[i] < 10f) feltIn7++ }
+            }
+        val wr = if (nRing > 0) whiteRing.toDouble() / nRing else 0.0
+        val wi = if (nIn6 > 0) whiteIn6.toDouble() / nIn6 else 0.0
+        val fi = if (nIn7 > 0) feltIn7.toDouble() / nIn7 else 0.0
+        if (fi > 0.12 && wr > 0.25) return true
+        if (wr > 0.3 && wi < 0.3) return true  // the cue ball is white inside, a ghost outline is not
+
         var nDisk = 0; var nInner = 0; var solidIn = 0
         var sumL = 0.0; var sumL2 = 0.0
         val ds = ArrayList<Float>()
@@ -317,23 +362,40 @@ class BallVision {
         return false
     }
 
-    class BallStats(val white: Double, val whiteOuter: Double, val blackOuter: Double, val colour: Double)
+    class BallStats(
+        val white: Double, val whiteOuter: Double, val blackOuter: Double, val colour: Double,
+        val light: Double, val opposite: Boolean,
+    )
 
+    /** Pixel shares inside the ball, ignoring the game's guide lines that may cross it. */
     private fun classify(p: Prep, cx: Double, cy: Double, R: Double): BallStats {
-        var nDisk = 0; var nOuter = 0; var wt = 0; var wo = 0; var bo = 0; var co = 0
-        for (y in max(0, (cy - R).toInt()) until min(p.h, (cy + R).toInt() + 1))
-            for (x in max(0, (cx - R).toInt()) until min(p.w, (cx + R).toInt() + 1)) {
-                val d = sqrt(sq(x - cx) + sq(y - cy)) / R
-                val i = y * p.w + x
-                val l = p.L[i]; val ch = sqrt(p.A[i] * p.A[i] + p.B[i] * p.B[i])
-                val white = l > 195f && ch < 22f
-                val black = l < 70f && ch < 25f
-                val colour = ch >= 25f && l > 35f
-                if (d <= 0.8) { nDisk++; if (white) wt++; if (colour) co++ }
-                if (d > 0.5 && d <= 0.85) { nOuter++; if (white) wo++; if (black) bo++ }
-            }
-        val nd = max(1, nDisk).toDouble(); val no = max(1, nOuter).toDouble()
-        return BallStats(wt / nd, wo / no, bo / no, co / nd)
+        fun stats(useGuide: Boolean): BallStats? {
+            var nDisk = 0; var nOuter = 0; var wt = 0; var wo = 0; var bo = 0; var co = 0; var lt = 0
+            val secN = IntArray(16); val secL = IntArray(16)
+            for (y in max(0, (cy - R).toInt()) until min(p.h, (cy + R).toInt() + 1))
+                for (x in max(0, (cx - R).toInt()) until min(p.w, (cx + R).toInt() + 1)) {
+                    val i = y * p.w + x
+                    if (useGuide && p.guide[i]) continue
+                    val d = sqrt(sq(x - cx) + sq(y - cy)) / R
+                    val l = p.L[i]; val ch = sqrt(p.A[i] * p.A[i] + p.B[i] * p.B[i])
+                    val white = l > 195f && ch < 22f
+                    val black = l < 70f && ch < 25f
+                    val colour = ch >= 25f && l > 35f
+                    val light = l > 150f && ch < 30f
+                    if (d <= 0.8) { nDisk++; if (white) wt++; if (colour) co++; if (light) lt++ }
+                    if (d > 0.5 && d <= 0.85) {
+                        nOuter++; if (white) wo++; if (black) bo++
+                        val a = ((kotlin.math.atan2(y - cy, x - cx) + PI) / (2 * PI) * 16).toInt() % 16
+                        secN[a]++; if (light) secL[a]++
+                    }
+                }
+            if (nDisk < 10) return null
+            val ws = BooleanArray(16) { secN[it] > 0 && secL[it].toDouble() / secN[it] >= 0.4 }
+            val opposite = (0 until 16).any { k -> ws[k] && (ws[(k + 7) % 16] || ws[(k + 8) % 16] || ws[(k + 9) % 16]) }
+            val nd = nDisk.toDouble(); val no = max(1, nOuter).toDouble()
+            return BallStats(wt / nd, wo / no, bo / no, co / nd, lt / nd, opposite)
+        }
+        return stats(true) ?: stats(false) ?: BallStats(0.0, 0.0, 0.0, 0.0, 0.0, false)
     }
 
     fun assignKinds(st: List<BallStats>): List<BallKind> {
@@ -346,7 +408,8 @@ class BallVision {
             if (kinds[i] != BallKind.UNKNOWN) continue
             val s = st[i]
             kinds[i] = when {
-                s.colour >= 0.12 && (s.whiteOuter >= 0.10 || s.colour < 0.62) -> BallKind.STRIPE
+                // Stripes show white on two OPPOSITE sides; a number disk or a line cap is one-sided.
+                s.colour >= 0.12 && (s.light > 0.6 || (s.opposite && s.whiteOuter >= 0.08)) -> BallKind.STRIPE
                 s.colour >= 0.25 -> BallKind.SOLID
                 else -> BallKind.UNKNOWN
             }

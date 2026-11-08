@@ -124,6 +124,18 @@ class Prep:
         fx_ = cv2.Sobel(self.F, cv2.CV_32F, 1, 0, ksize=3)
         fy_ = cv2.Sobel(self.F, cv2.CV_32F, 0, 1, ksize=3)
         wl = 0.15  # a little raw colour edge so touching balls stay separable
+        # The game's own guide lines: thin, bright and LONG (stripe caps and highlights are short).
+        chroma = np.sqrt(self.A ** 2 + self.B ** 2)
+        bright = ((self.L > 150) & (chroma < 30)).astype(np.uint8)
+        k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        thin = bright & (1 - cv2.morphologyEx(bright, cv2.MORPH_OPEN, k5))
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(thin, connectivity=8)
+        keep = np.zeros(n, bool)
+        for i in range(1, n):
+            if max(stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]) >= 2.2 * TARGET_R:
+                keep[i] = True
+        guide = keep[lab].astype(np.uint8)
+        self.guide = cv2.dilate(guide, k5).astype(bool)
         self.gxx = fx_ * fx_ + wl * (gx * gx + ax * ax + bx * bx)
         self.gyy = fy_ * fy_ + wl * (gy * gy + ay * ay + by * by)
         self.gxy = fx_ * fy_ + wl * (gx * gy + ax * ay + bx * by)
@@ -236,6 +248,23 @@ def is_fake(P, cx, cy, R):
     d = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / R
     D = P.D[y0:y1, x0:x1]; L = P.L[y0:y1, x0:x1]
     disk = d <= 0.85; inner = d <= 0.55
+    # Game ghost ball: a bright white outline at ball radius with plain felt showing inside it.
+    A = P.A[y0:y1, x0:x1]; Bc = P.B[y0:y1, x0:x1]
+    felt_in = float((D[d <= 0.7] < 10).mean())
+    xs0, xs1 = max(0, int(cx - 1.2 * R)), min(P.w, int(cx + 1.2 * R) + 1)
+    ys0, ys1 = max(0, int(cy - 1.2 * R)), min(P.h, int(cy + 1.2 * R) + 1)
+    yy2, xx2 = np.mgrid[ys0:ys1, xs0:xs1]
+    d2 = np.sqrt((xx2 - cx) ** 2 + (yy2 - cy) ** 2) / R
+    ring = (d2 > 0.8) & (d2 <= 1.15)
+    Lr = P.L[ys0:ys1, xs0:xs1][ring]; Cr = np.sqrt(P.A[ys0:ys1, xs0:xs1][ring] ** 2 + P.B[ys0:ys1, xs0:xs1][ring] ** 2)
+    white_ring = float(((Lr > 190) & (Cr < 30)).mean()) if Lr.size else 0.0
+    inner6 = d <= 0.6
+    Ci = np.sqrt(A[inner6] ** 2 + Bc[inner6] ** 2)
+    white_in = float(((L[inner6] > 190) & (Ci < 30)).mean())
+    if felt_in > 0.12 and white_ring > 0.25:
+        return True
+    if white_ring > 0.3 and white_in < 0.3:   # white outline with a non-white inside (cue ball is white inside)
+        return True
     solid_in = float((D[inner] > 18).mean())
     dmed = float(np.median(D[disk]))
     lstd = float(np.std(L[disk]))
@@ -249,20 +278,36 @@ def is_fake(P, cx, cy, R):
 
 
 def classify(P, cx, cy, R):
-    """Returns (kind, white_total, white_outer, black, colour)."""
+    """Pixel shares inside the ball, ignoring the game's thin guide lines that may cross it."""
     x0, x1 = int(cx - R), int(cx + R) + 1
     y0, y1 = int(cy - R), int(cy + R) + 1
-    yy, xx = np.mgrid[max(0, y0):min(P.h, y1), max(0, x0):min(P.w, x1)]
+    x0c, x1c, y0c, y1c = max(0, x0), min(P.w, x1), max(0, y0), min(P.h, y1)
+    yy, xx = np.mgrid[y0c:y1c, x0c:x1c]
     d = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / R
-    L = P.L[yy, xx]; A = P.A[yy, xx]; B = P.B[yy, xx]
+    L = P.L[y0c:y1c, x0c:x1c]; A = P.A[y0c:y1c, x0c:x1c]; B = P.B[y0c:y1c, x0c:x1c]
     chroma = np.sqrt(A * A + B * B)
-    disk = d <= 0.8
-    outer = (d > 0.5) & (d <= 0.85)
+    thin = P.guide[y0c:y1c, x0c:x1c]
+    disk = (d <= 0.8) & ~thin
+    outer = (d > 0.5) & (d <= 0.85) & ~thin
+    if disk.sum() < 10:
+        disk = d <= 0.8; outer = (d > 0.5) & (d <= 0.85)
     white = (L > 195) & (chroma < 22)
     black = (L < 70) & (chroma < 25)
     colour = (chroma >= 25) & (L > 35)
-    wt = white[disk].mean(); wo = white[outer].mean(); bo = black[outer].mean(); co = colour[disk].mean()
-    return dict(white=float(wt), white_outer=float(wo), black_outer=float(bo), colour=float(co))
+    wt = white[disk].mean(); wo = white[outer].mean() if outer.any() else 0.0
+    bo = black[outer].mean() if outer.any() else 0.0; co = colour[disk].mean()
+    # Stripes show white on two OPPOSITE sides of the rim; a number disk or the game's line cap is one-sided.
+    light = (L > 150) & (chroma < 30)
+    ang = ((np.arctan2(yy - cy, xx - cx) + math.pi) / (2 * math.pi) * 16).astype(int) % 16
+    ann = (d > 0.5) & (d <= 0.85) & ~thin
+    ws = []
+    for k in range(16):
+        m = ann & (ang == k)
+        ws.append(bool(m.sum() > 0 and light[m].mean() >= 0.4))
+    opposite = any(ws[k] and (ws[(k + 7) % 16] or ws[(k + 8) % 16] or ws[(k + 9) % 16]) for k in range(16))
+    lt = light[disk].mean()
+    return dict(white=float(wt), white_outer=float(wo), black_outer=float(bo), colour=float(co),
+                light=float(lt), opposite=bool(opposite))
 
 
 def assign_kinds(balls):
@@ -279,7 +324,7 @@ def assign_kinds(balls):
     for i, s in enumerate(stats):
         if kinds[i] != "unknown":
             continue
-        if s["colour"] >= 0.12 and (s["white_outer"] >= 0.10 or s["colour"] < 0.62):
+        if s["colour"] >= 0.12 and (s["light"] > 0.6 or (s["opposite"] and s["white_outer"] >= 0.08)):
             kinds[i] = "stripe"
         elif s["colour"] >= 0.25:
             kinds[i] = "solid"
