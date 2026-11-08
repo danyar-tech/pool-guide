@@ -34,7 +34,12 @@ class AimView(
     private val onRadiusEdited: (Double) -> Unit,
     private val onCueEdited: () -> Unit,
     private val onAimEdited: () -> Unit,
+    private val onPicked: () -> Unit,
 ) : View(ctx) {
+
+    /** One-tap target picking (Best shot mode): the next tap on a ball makes it the target. */
+    var pickMode = false
+        set(v) { field = v; invalidate() }
 
     var editMode = false
         set(v) { field = v; invalidate() }
@@ -77,6 +82,8 @@ class AimView(
     private val handleRing = stroke(Color.WHITE, 2f)
     private val sizerPaint = stroke(Color.rgb(255, 145, 0), 2.5f)
     private val sizerHandle = fill(Color.rgb(255, 145, 0))
+    private val jawPaint = stroke(Color.rgb(255, 82, 82), 3f)
+    private val mouthPaint = dashed(stroke(Color.argb(200, 255, 82, 82), 1.5f), 4f, 4f)
     private val dimPaint = fill(Color.argb(60, 0, 0, 0))
     private val cardBg = fill(Color.argb(215, 18, 22, 28))
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textSize = 14 * dp }
@@ -169,6 +176,15 @@ class AimView(
             }
         }
 
+        if (editMode || pickMode) {
+            // Pocket mouths: the ball must pass between the red jaw marks with a radius to spare.
+            for (i in t.pockets.indices) {
+                val (ja, jb) = PocketGeom.jaws(t, i, r.toDouble(), prefs.pocketScale.toDouble())
+                c.drawLine(ja.x.toFloat(), ja.y.toFloat(), jb.x.toFloat(), jb.y.toFloat(), mouthPaint)
+                c.drawCircle(ja.x.toFloat(), ja.y.toFloat(), 3.5f * dp, fill(red))
+                c.drawCircle(jb.x.toFloat(), jb.y.toFloat(), 3.5f * dp, fill(red))
+            }
+        }
         if (editMode) {
             for (h in handles(t)) {
                 c.drawCircle(h.x.toFloat(), h.y.toFloat(), 10 * dp, handlePaint)
@@ -249,7 +265,7 @@ class AimView(
             editMode -> {
                 lines += "EDIT · ${tool.label}"
                 lines += when (tool) {
-                    EditTool.MOVE -> "Drag blue dots to the cushion edges. Orange ring = ball size. Drag balls/pockets; tap one to force it."
+                    EditTool.MOVE -> "Blue dots → cushion edges. Orange ring → ball size. Red marks = pocket jaws (Pockets −/+)."
                     EditTool.ADD -> "Tap the table to add a ball"
                     EditTool.DELETE -> "Tap a ball to remove it"
                     EditTool.CUE -> "Tap the ball that is the cue ball"
@@ -258,6 +274,7 @@ class AimView(
                     EditTool.AIM -> "Drag anywhere: the stick points from the cue ball toward your finger"
                 }
             }
+            pickMode -> { lines += "Tap the ball you want to pot"; lines += "Tap empty felt to go back to automatic" }
             state.table == null -> { lines += "No table yet"; lines += "Tap Edit and drag the blue dots to the table's cushions" }
             state.moving -> lines += "Balls moving…"
             prefs.predictMode -> {
@@ -279,6 +296,7 @@ class AimView(
                         pred.contact == null -> "Misses every ball"
                         pred.objectPocket >= 0 && pred.scratch -> "Pots in ${pocketName(pred.objectPocket)} — but scratch!"
                         pred.objectPocket >= 0 -> "POTS in ${pocketName(pred.objectPocket)}"
+                        pred.objectJaw -> "Misses — rattles on the pocket jaw"
                         pred.objectHitsBallId >= 0 -> "Misses — object ball hits another ball"
                         else -> "Misses — object ball hits the cushion"
                     }
@@ -340,6 +358,16 @@ class AimView(
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (pickMode) {
+            if (e.actionMasked == MotionEvent.ACTION_UP) {
+                getLocationOnScreen(loc)
+                val p = Vec((e.x + loc[0]).toDouble(), (e.y + loc[1]).toDouble())
+                val b = nearestBall(p)
+                state.forcedTargetPos = if (b != null && b.kind != BallKind.CUE) b.pos else null
+                onPicked()
+            }
+            return true
+        }
         if (!editMode) return false
         getLocationOnScreen(loc)
         val p = Vec((e.x + loc[0]).toDouble(), (e.y + loc[1]).toDouble())

@@ -213,6 +213,8 @@ def detect_v2(rgb, table, radius, return_debug=False):
         dc = float(Dc[int(round(fy)), int(round(fx))])
         # full circular edge + the inside differs from the felt (rejects the game's hollow ghost-ball circle)
         ok = cov >= 0.6 and dm >= 22 and dc >= 15
+        if ok and is_fake(P, fx, fy, R):
+            ok = False
         if ok:
             kept.append((sc, fx, fy, cov))
         if len(kept) >= 22:
@@ -223,6 +225,27 @@ def detect_v2(rgb, table, radius, return_debug=False):
         balls.append((P.l + fx / P.s, P.t + fy / P.s, kind))
     # only one cue ball: keep the whitest, demote the rest
     return (balls, P) if return_debug else balls
+
+
+def is_fake(P, cx, cy, R):
+    """Rejects the game's own guideline graphics and felt logos: see-through ghost balls are flat and
+    felt-coloured, outlines/logo rings are hollow and low-contrast. Real balls are shaded and solid."""
+    x0, x1 = max(0, int(cx - R)), min(P.w, int(cx + R) + 1)
+    y0, y1 = max(0, int(cy - R)), min(P.h, int(cy + R) + 1)
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    d = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / R
+    D = P.D[y0:y1, x0:x1]; L = P.L[y0:y1, x0:x1]
+    disk = d <= 0.85; inner = d <= 0.55
+    solid_in = float((D[inner] > 18).mean())
+    dmed = float(np.median(D[disk]))
+    lstd = float(np.std(L[disk]))
+    if lstd < 26 and dmed < 60:
+        return True
+    if solid_in < 0.7 and lstd < 32:
+        return True
+    if solid_in < 0.5 and dmed < 14:
+        return True
+    return False
 
 
 def classify(P, cx, cy, R):
@@ -373,3 +396,161 @@ def estimate_radius(rgb, table):
         if sc > best[0]:
             best = (sc, R)
     return best[1]
+
+
+def _bil(img, x, y):
+    h, w = img.shape
+    xi, yi = int(math.floor(x)), int(math.floor(y))
+    if xi < 0 or yi < 0 or xi >= w - 1 or yi >= h - 1:
+        return None
+    fx, fy = x - xi, y - yi
+    return float(img[yi, xi] * (1 - fx) * (1 - fy) + img[yi, xi + 1] * fx * (1 - fy) +
+                 img[yi + 1, xi] * (1 - fx) * fy + img[yi + 1, xi + 1] * fx * fy)
+
+
+def _run(img, cx, cy, ang, thr, r0, r1, step, max_gap, max_start):
+    """Longest run of samples above thr along a ray (gaps up to max_gap samples allowed).
+    Returns (length in px, mean value in run, start dist, end dist)."""
+    ux, uy = math.cos(ang), math.sin(ang)
+    n = int((r1 - r0) / step) + 1
+    best = (0.0, 0.0, 0.0, 0.0)
+    cur_s = None; gap = 0; acc = []; last_hi = None
+    for i in range(n):
+        d = r0 + i * step
+        v = _bil(img, cx + ux * d, cy + uy * d)
+        if v is None:
+            break
+        if v > thr:
+            if cur_s is None:
+                if d > max_start:
+                    break
+                cur_s = d; acc = []
+            acc.append(v); last_hi = d; gap = 0
+        elif cur_s is not None:
+            gap += 1
+            if gap > max_gap:
+                L = last_hi - cur_s
+                if L > best[0]:
+                    best = (L, sum(acc) / len(acc), cur_s, last_hi)
+                cur_s = None
+                if r0 + i * step > max_start:
+                    break
+    if cur_s is not None and last_hi is not None:
+        L = last_hi - cur_s
+        if L > best[0]:
+            best = (L, sum(acc) / len(acc), cur_s, last_hi)
+    return best
+
+
+def _bar_profile(P, img, cx, cy, ang, a, b, R):
+    """Width (in R) and centre colour of a bar along a ray between distances a and b."""
+    ux, uy = math.cos(ang), math.sin(ang)
+    widths, Ls, Cs = [], [], []
+    for d in np.linspace(a, b, 12):
+        px, py = cx + ux * d, cy + uy * d
+        offs = np.arange(-1.0, 1.0001, 0.02) * R
+        prof = [_bil(img, px - uy * o, py + ux * o) for o in offs]
+        if any(v is None for v in prof):
+            continue
+        prof = np.array(prof); mx = prof.max()
+        if mx <= 0:
+            continue
+        widths.append((prof > mx * 0.5).sum() * 0.02)
+        i = int(np.argmax(prof)); o = offs[i]
+        l = _bil(P.L, px - uy * o, py + ux * o); A = _bil(P.A, px - uy * o, py + ux * o); B = _bil(P.B, px - uy * o, py + ux * o)
+        if l is not None:
+            Ls.append(l); Cs.append(math.hypot(A, B))
+    return widths, Ls, Cs
+
+
+def detect_stick2(P, cue_xy_full, table):
+    """Shot direction from the cue stick (thick bar behind the cue ball) and/or the game's aim line
+    (thin line in front), scored together so the direction cannot flip."""
+    R = TARGET_R
+    cx, cy = (cue_xy_full[0] - P.l) * P.s, (cue_xy_full[1] - P.t) * P.s
+    k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    thick = cv2.morphologyEx(P.D.astype(np.float32), cv2.MORPH_OPEN, k3)       # bars survive, thin lines vanish
+    Lp = np.maximum(P.L - P.Lbg, 0).astype(np.float32)
+    thin = np.maximum(Lp - cv2.morphologyEx(Lp, cv2.MORPH_OPEN, k3), 0)         # top-hat: thin bright lines only
+    thin = cv2.GaussianBlur(thin, (3, 3), 0.6)
+    step = R * 0.25
+    cands = []
+    for i in range(720):
+        phi = 2 * math.pi * i / 720
+        sL, sM, s0, s1 = _run(thick, cx, cy, phi + math.pi, 14, R * 1.15, R * 18, step, 1, R * 7)
+        lL, lM, l0, l1 = _run(thin, cx, cy, phi, 8, R * 1.0, R * 18, step, 3, R * 2.2)
+        cands.append((phi, sL, sM, s0, s1, lL, lM, l0, l1))
+
+    def score(c, use_stick=True, use_line=True):
+        phi, sL, sM, s0, s1, lL, lM, l0, l1 = c
+        ss = sL / R if (use_stick and sL >= 3 * R) else 0.0
+        ls = lL / R if (use_line and lL >= 2.5 * R) else 0.0
+        return ss * min(sM / 40, 1.5) + 1.3 * ls * min(lM / 25, 1.5), ss > 0, ls > 0
+
+    order = sorted(cands, key=lambda c: -score(c)[0])
+    tried = []
+    result = None
+    for c in order:
+        if len(tried) >= 8 or score(c)[0] <= 0:
+            break
+        phi = c[0]
+        if any(abs((phi - t + math.pi) % (2 * math.pi) - math.pi) < math.radians(3) for t in tried):
+            continue
+        tried.append(phi)
+        sc, has_s, has_l = score(c)
+        srange = (c[3], c[4]) if has_s else None
+        lrange = (c[7], c[8]) if has_l else None
+        reinterpret = False
+        if srange:
+            widths, Ls, Cs = _bar_profile(P, P.D, cx, cy, phi + math.pi, srange[0], srange[1], R)
+            if not widths:
+                srange = None
+            else:
+                w30, w50, w70 = np.percentile(widths, [30, 50, 70])
+                whitish = Ls and np.median(Ls) > 185 and np.median(Cs) < 30
+                if w50 > 0.95 or (w70 - w30) > 0.35:
+                    srange = None                          # a row of balls, not a stick
+                elif w30 < 0.42 and whitish and not lrange:
+                    reinterpret = True                     # thin white line: the game's aim line
+                elif w30 < 0.2:
+                    reinterpret = not lrange
+        if reinterpret:
+            phi = (phi + math.pi) % (2 * math.pi)
+            lrange, srange = srange, None
+        if not srange and not lrange:
+            continue
+        result = (phi, srange, lrange, reinterpret)
+        break
+    if result is None:
+        return None
+    phi, srange, lrange, reinterpret = result
+    # joint sub-pixel line fit through stick (behind, negative distances) and line (in front)
+    pts = []
+    ux, uy = math.cos(phi), math.sin(phi)
+    def collect(img, a, b, sign):
+        for d in np.arange(a, b, R * 0.25):
+            px, py = cx + ux * d * sign, cy + uy * d * sign
+            offs = np.arange(-0.6, 0.6001, 0.03) * R
+            prof = [_bil(img, px - uy * o, py + ux * o) for o in offs]
+            if any(v is None for v in prof):
+                continue
+            prof = np.array(prof); mx = prof.max()
+            if mx <= 6:
+                continue
+            w_ = np.maximum(prof - mx * 0.5, 0)
+            if w_.sum() > 0:
+                pts.append((d * sign, float((offs * w_).sum() / w_.sum())))
+    if srange:
+        collect(thick, srange[0], srange[1], -1)
+    if lrange:
+        collect(P.D if reinterpret else thin, lrange[0], lrange[1], 1)
+    if len(pts) >= 6:
+        d_ = np.array([p[0] for p in pts]); o_ = np.array([p[1] for p in pts])
+        for _ in range(2):
+            b, a = np.polyfit(d_, o_, 1)
+            res = np.abs(o_ - (a + b * d_))
+            keep = res <= np.percentile(res, 80) + 1e-6
+            d_, o_ = d_[keep], o_[keep]
+        b, a = np.polyfit(d_, o_, 1)
+        phi += math.atan(b)
+    return phi % (2 * math.pi), ("stick+line" if srange and lrange else "stick" if srange else "line")

@@ -421,7 +421,8 @@ class OverlayService : Service() {
             onSelectionChanged = { replan() },
             onRadiusEdited = { r -> prefs.ballRadius = r.toFloat(); replan() },
             onCueEdited = { if (!prefs.cueManual) prefs.cueManual = true; replan() },
-            onAimEdited = { if (!prefs.stickManual) prefs.stickManual = true; replan() })
+            onAimEdited = { if (!prefs.stickManual) prefs.stickManual = true; replan() },
+            onPicked = { setPicking(false); replan() })
         wm.addView(view, ap)
         aim = view; aimParams = ap
 
@@ -450,10 +451,22 @@ class OverlayService : Service() {
         p.btnLive.setOnClickListener { live = !live; updatePanel() }
         p.btnScan.setOnClickListener {
             state.ballsManual = false
-            state.forcedTargetPos = null
-            state.forcedPocket = -1
             capture(detectTable = true, single = true)
         }
+        p.btnTarget.setOnClickListener {
+            if (state.forcedTargetPos != null || state.forcedPocket >= 0) {
+                state.forcedTargetPos = null; state.forcedPocket = -1; replan()
+            } else {
+                setPicking(true)
+            }
+        }
+        fun pockets(delta: Float) {
+            prefs.pocketScale = prefs.pocketScale + delta
+            toast("Pocket size ${(prefs.pocketScale * 100).toInt()}%")
+            replan()
+        }
+        p.btnPocketMinus.setOnClickListener { pockets(-0.05f) }
+        p.btnPocketPlus.setOnClickListener { pockets(0.05f) }
         p.btnMode.setOnClickListener { prefs.predictMode = !prefs.predictMode; replan() }
         p.btnNext.setOnClickListener {
             if (state.shots.isNotEmpty()) state.shotIndex = (state.shotIndex + 1) % state.shots.size
@@ -489,7 +502,7 @@ class OverlayService : Service() {
         }
         p.setRepeat(p.btnRotL) { rotate(-1, it) }
         p.setRepeat(p.btnRotR) { rotate(1, it) }
-        p.btnEdit.setOnClickListener { setEditing(true) }
+        p.btnEdit.setOnClickListener { if (aim?.pickMode == true) setPicking(false); setEditing(true) }
         p.btnHide.setOnClickListener {
             aim?.let { it.guidesVisible = !it.guidesVisible }
             updatePanel()
@@ -517,6 +530,23 @@ class OverlayService : Service() {
             setEditing(false)
             if (!state.ballsManual) capture(detectTable = false, single = true)
         }
+    }
+
+    /** Target picking: the overlay takes exactly one tap, then lets touches through to the game again. */
+    private fun setPicking(on: Boolean) {
+        val a = aim ?: return
+        val ap = aimParams ?: return
+        if (editing) return
+        a.pickMode = on
+        if (on) {
+            ap.flags = ap.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+            ap.alpha = 1f
+        } else {
+            ap.flags = passThroughFlags()
+            ap.alpha = 0.8f
+        }
+        runCatching { wm.updateViewLayout(a, ap) }
+        updatePanel()
     }
 
     private fun setEditing(on: Boolean) {
@@ -551,6 +581,13 @@ class OverlayService : Service() {
         p.setActive(p.btnMode, prefs.predictMode)
         p.btnGroup.text = when (prefs.group) { Group.ANY -> "Any"; Group.SOLIDS -> "Solids"; Group.STRIPES -> "Stripes" }
         p.btnCue.text = if (prefs.cueManual) "Cue: Man" else "Cue: Auto"
+        val picked = state.forcedTargetPos != null || state.forcedPocket >= 0
+        p.btnTarget.text = when {
+            aim?.pickMode == true -> "Tap a ball…"
+            picked -> "Target ✓ (tap = Auto)"
+            else -> "Target: Auto"
+        }
+        p.setActive(p.btnTarget, picked || aim?.pickMode == true)
         p.setActive(p.btnCue, prefs.cueManual)
         p.setActive(p.btnStick, prefs.stickManual)
         p.btnHide.text = if (aim?.guidesVisible == false) "Show" else "Hide"

@@ -33,6 +33,7 @@ class ControlPanel(
     val btnScan = button("Scan")
     val btnMode = button("Best")
     val btnNext = button("Next")
+    val btnTarget = button("Target: Auto")
     val btnCue = button("Cue: Auto")
     val btnStick = button("Stick: Auto")
     val btnRotL = button("◀")
@@ -45,6 +46,8 @@ class ControlPanel(
     val toolButtons = EditTool.values().associateWith { button(it.label) }
     val btnRedetect = button("Auto table")
     val btnAutoSize = button("Auto size")
+    val btnPocketMinus = button("Pockets −")
+    val btnPocketPlus = button("Pockets +")
     val btnClear = button("Clear pick")
     val btnDone = button("Done")
 
@@ -71,11 +74,11 @@ class ControlPanel(
         addView(top)
 
         normalRow.orientation = HORIZONTAL
-        listOf(btnLive, btnScan, btnMode, btnNext, btnGroup, btnCue, btnStick, btnRotL, btnRotR, btnEdit, btnHide, btnStop)
+        listOf(btnLive, btnScan, btnMode, btnTarget, btnNext, btnGroup, btnCue, btnStick, btnRotL, btnRotR, btnEdit, btnHide, btnStop)
             .forEach { normalRow.addView(it) }
         editRow.orientation = HORIZONTAL
         toolButtons.values.forEach { editRow.addView(it) }
-        listOf(btnAutoSize, btnRedetect, btnClear, btnDone).forEach { editRow.addView(it) }
+        listOf(btnPocketMinus, btnPocketPlus, btnAutoSize, btnRedetect, btnClear, btnDone).forEach { editRow.addView(it) }
         editRow.visibility = GONE
 
         rows.orientation = VERTICAL
@@ -114,6 +117,7 @@ class ControlPanel(
         btnMode.text = if (predict) "Predict" else "Best shot"
         btnNext.visibility = if (predict) GONE else VISIBLE
         btnGroup.visibility = if (predict) GONE else VISIBLE
+        btnTarget.visibility = if (predict) GONE else VISIBLE
         btnStick.visibility = if (predict) VISIBLE else GONE
         btnStick.text = if (stickManual) "Stick: Man" else "Stick: Auto"
         btnRotL.visibility = if (predict && stickManual) VISIBLE else GONE

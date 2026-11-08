@@ -27,6 +27,8 @@ data class PlannerConfig(
     val forcedTargetId: Int = -1,
     /** Pocket index the player picked by hand, or -1 for automatic. */
     val forcedPocket: Int = -1,
+    /** Size of the pocket mouths relative to the default (matches the game's pockets). */
+    val pocketScale: Double = 1.0,
 )
 
 data class Shot(
@@ -109,7 +111,9 @@ class Planner(private val cfg: PlannerConfig) {
 
     private fun direct(scene: Scene, cue: Ball, t: Ball, pi: Int, pocket: Pocket): Shot? {
         val r = scene.ballRadius
-        val objDir = (pocket.pos - t.pos).norm()
+        val (ja, jb) = PocketGeom.jaws(scene.table, pi, r, cfg.pocketScale)
+        val e = PocketGeom.entry(t.pos, ja, jb, r) ?: return null
+        val objDir = (e.aim - t.pos).norm()
         val ghost = t.pos - objDir * (2 * r)
         if (!scene.insidePlayable(ghost, r * 0.25)) return null
         val incoming = ghost - cue.pos
@@ -117,10 +121,10 @@ class Planner(private val cfg: PlannerConfig) {
         val cut = Vec.angle(incoming, objDir)
         if (cut > Math.toRadians(cfg.maxCutDeg)) return null
         if (!clear(scene, cue.pos, ghost, setOf(cue.id, t.id))) return null
-        if (!clear(scene, t.pos, pocket.pos, setOf(cue.id, t.id))) return null
-        val accept = pocketAcceptance(scene, pocket, objDir) ?: return null
+        if (!clear(scene, t.pos, e.aim, setOf(cue.id, t.id))) return null
+        val accept = max(e.margin, r * 0.02)
 
-        val dObj = t.pos.dist(pocket.pos)
+        val dObj = t.pos.dist(e.aim)
         val dCue = incoming.len()
         val vObj = objectStartSpeed(scene, listOf(dObj))
         val power = cueStartPower(scene, listOf(dCue), vObj, cut)
@@ -128,18 +132,22 @@ class Planner(private val cfg: PlannerConfig) {
         val scratch = scratchOnPath(scene, tangent, cut)
         val score = scoreOf(r, dCue, dObj, cut, accept) *
             (if (scratch) 0.6 else 1.0) * kindWeight(t) * powerWeight(power)
-        return Shot(ShotType.DIRECT, t.id, pi, listOf(cue.pos, ghost), listOf(t.pos, pocket.pos),
+        return Shot(ShotType.DIRECT, t.id, pi, listOf(cue.pos, ghost), listOf(t.pos, e.drop),
             ghost, ghost, Math.toDegrees(cut), power, score, tangent, scratch)
     }
 
     private fun banks(scene: Scene, cue: Ball, t: Ball, pi: Int, pocket: Pocket): List<Shot> {
         val r = scene.ballRadius
         val res = ArrayList<Shot>()
+        val (ja, jb) = PocketGeom.jaws(scene.table, pi, r, cfg.pocketScale)
         for (rail in Rail.values()) {
             if (pocketOnRail(scene, pocket, rail)) continue
-            val mirrored = mirror(scene, pocket.pos, rail)
-            val bank = railHit(scene, t.pos, mirrored, rail) ?: continue
+            // Unfold the cushion: aim through the mirror image of the pocket mouth.
+            val e = PocketGeom.entry(t.pos, mirror(scene, ja, rail), mirror(scene, jb, rail), r) ?: continue
+            val bank = railHit(scene, t.pos, e.aim, rail) ?: continue
             if (nearPocket(scene, bank, r * 2.5)) continue
+            val realAim = mirror(scene, e.aim, rail)
+            val realDrop = mirror(scene, e.drop, rail)
             val objDir = (bank - t.pos).norm()
             val ghost = t.pos - objDir * (2 * r)
             if (!scene.insidePlayable(ghost, r * 0.25)) continue
@@ -150,12 +158,11 @@ class Planner(private val cfg: PlannerConfig) {
             val ex = setOf(cue.id, t.id)
             if (!clear(scene, cue.pos, ghost, ex)) continue
             if (!clear(scene, t.pos, bank, ex)) continue
-            if (!clear(scene, bank, pocket.pos, ex)) continue
-            val finalDir = (pocket.pos - bank).norm()
-            val accept = pocketAcceptance(scene, pocket, finalDir) ?: continue
+            if (!clear(scene, bank, realAim, ex)) continue
+            val accept = max(e.margin, r * 0.02)
 
             val d1 = t.pos.dist(bank)
-            val d2 = bank.dist(pocket.pos)
+            val d2 = bank.dist(realAim)
             val dCue = incoming.len()
             val vObj = objectStartSpeed(scene, listOf(d1, d2))
             val power = cueStartPower(scene, listOf(dCue), vObj, cut)
@@ -164,7 +171,7 @@ class Planner(private val cfg: PlannerConfig) {
             // Banks are less predictable (rail rebound, throw), so the effective distance is inflated.
             val score = scoreOf(r, dCue, (d1 + d2) * 1.35, cut, accept) * 0.55 *
                 (if (scratch) 0.6 else 1.0) * kindWeight(t) * powerWeight(power)
-            res += Shot(ShotType.BANK, t.id, pi, listOf(cue.pos, ghost), listOf(t.pos, bank, pocket.pos),
+            res += Shot(ShotType.BANK, t.id, pi, listOf(cue.pos, ghost), listOf(t.pos, bank, realDrop),
                 ghost, ghost, Math.toDegrees(cut), power, score, tangent, scratch)
         }
         return res
@@ -173,12 +180,14 @@ class Planner(private val cfg: PlannerConfig) {
     private fun kicks(scene: Scene, cue: Ball, t: Ball, pi: Int, pocket: Pocket): List<Shot> {
         val r = scene.ballRadius
         val res = ArrayList<Shot>()
-        val objDir = (pocket.pos - t.pos).norm()
+        val (ja, jb) = PocketGeom.jaws(scene.table, pi, r, cfg.pocketScale)
+        val e = PocketGeom.entry(t.pos, ja, jb, r) ?: return res
+        val objDir = (e.aim - t.pos).norm()
         val ghost = t.pos - objDir * (2 * r)
         if (!scene.insidePlayable(ghost, r * 0.25)) return res
         val ex = setOf(cue.id, t.id)
-        if (!clear(scene, t.pos, pocket.pos, ex)) return res
-        val accept = pocketAcceptance(scene, pocket, objDir) ?: return res
+        if (!clear(scene, t.pos, e.aim, ex)) return res
+        val accept = max(e.margin, r * 0.02)
         for (rail in Rail.values()) {
             val mirrored = mirror(scene, ghost, rail)
             val hit = railHit(scene, cue.pos, mirrored, rail) ?: continue
@@ -191,14 +200,14 @@ class Planner(private val cfg: PlannerConfig) {
             if (!clear(scene, hit, ghost, ex)) continue
             val d1 = cue.pos.dist(hit)
             val d2 = hit.dist(ghost)
-            val dObj = t.pos.dist(pocket.pos)
+            val dObj = t.pos.dist(e.aim)
             val vObj = objectStartSpeed(scene, listOf(dObj))
             val power = cueStartPower(scene, listOf(d1, d2), vObj, cut)
             val tangent = tangentPath(scene, ghost, incoming.norm(), objDir)
             val scratch = scratchOnPath(scene, tangent, cut)
             val score = scoreOf(r, (d1 + d2) * 1.4, dObj, cut, accept) * 0.45 *
                 (if (scratch) 0.6 else 1.0) * kindWeight(t) * powerWeight(power)
-            res += Shot(ShotType.KICK, t.id, pi, listOf(cue.pos, hit, ghost), listOf(t.pos, pocket.pos),
+            res += Shot(ShotType.KICK, t.id, pi, listOf(cue.pos, hit, ghost), listOf(t.pos, e.drop),
                 ghost, hit, Math.toDegrees(cut), power, score, tangent, scratch)
         }
         return res
@@ -260,27 +269,6 @@ class Planner(private val cfg: PlannerConfig) {
 
     private fun nearPocket(scene: Scene, p: Vec, d: Double) =
         scene.table.pockets.any { it.pos.dist(p) < d + scene.table.pocketRadius }
-
-    /** Effective half-width of the pocket opening for this approach direction, or null if it can't go in. */
-    fun pocketAcceptance(scene: Scene, pocket: Pocket, approach: Vec): Double? {
-        val tb = scene.table
-        val c = tb.center
-        val normal = if (pocket.side) {
-            if (tb.horizontal) Vec(0.0, sign(pocket.pos.y - c.y)) else Vec(sign(pocket.pos.x - c.x), 0.0)
-        } else {
-            Vec(sign(pocket.pos.x - c.x), sign(pocket.pos.y - c.y)).norm()
-        }
-        val dev = Vec.angle(approach, normal)
-        val factor = if (pocket.side) {
-            if (dev > Math.toRadians(62.0)) return null
-            cos(dev)
-        } else {
-            if (dev > Math.toRadians(80.0)) return null
-            cos(max(0.0, dev - PI / 4)) // anything within 45 deg of the diagonal is full width
-        }
-        val half = max(tb.pocketRadius, scene.ballRadius * 1.2) * 0.85 * factor
-        return if (half < scene.ballRadius * 0.12) null else half
-    }
 
     /** Cue ball direction after contact for a stun shot (90 degree rule), traced to the first rail and one rebound. */
     private fun tangentPath(scene: Scene, ghost: Vec, incoming: Vec, objDir: Vec): List<Vec> {

@@ -62,6 +62,11 @@ class Prefs(ctx: Context) {
         get() = sp.getBoolean("stickManual", false)
         set(v) = sp.edit().putBoolean("stickManual", v).apply()
 
+    /** Pocket mouth size relative to the default; match it to the game's pockets in Edit. */
+    var pocketScale: Float
+        get() = sp.getFloat("pocketScale", 1f)
+        set(v) = sp.edit().putFloat("pocketScale", v.coerceIn(0.5f, 1.8f)).apply()
+
     var lockTable: Boolean
         get() = sp.getBoolean("lockTable", false)
         set(v) = sp.edit().putBoolean("lockTable", v).apply()
@@ -95,6 +100,7 @@ class Prefs(ctx: Context) {
         powerCurve = powerCurve,
         forcedTargetId = forcedTarget,
         forcedPocket = forcedPocket,
+        pocketScale = pocketScale.toDouble(),
     )
 }
 

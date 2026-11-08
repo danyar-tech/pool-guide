@@ -277,7 +277,7 @@ class BallVision {
             val cov = ringCoverage(p, fx, fy, R)
             val ix = fx.roundToInt().coerceIn(0, w - 1); val iy = fy.roundToInt().coerceIn(0, h - 1)
             val dmv = dm[iy * w + ix]; val dcv = dc[iy * w + ix]
-            if (cov >= 0.6 && dmv >= 22f && dcv >= 15f) kept += Kept(fx, fy, cov)
+            if (cov >= 0.6 && dmv >= 22f && dcv >= 15f && !isFake(p, fx, fy, R)) kept += Kept(fx, fy, cov)
             if (kept.size >= 22) break
         }
 
@@ -285,6 +285,36 @@ class BallVision {
         val kinds = assignKinds(stats)
         val balls = kept.mapIndexed { i, k -> Ball(i, p.toScreen(k.x, k.y), kinds[i]) }
         return BallDetection(balls, radius)
+    }
+
+    /**
+     * Rejects the game's own guideline graphics and felt logos: see-through ghost balls are flat and
+     * felt-coloured, outlines and logo rings are hollow and low-contrast. Real balls are shaded and solid.
+     */
+    private fun isFake(p: Prep, cx: Double, cy: Double, R: Double): Boolean {
+        var nDisk = 0; var nInner = 0; var solidIn = 0
+        var sumL = 0.0; var sumL2 = 0.0
+        val ds = ArrayList<Float>()
+        for (y in max(0, (cy - R).toInt()) until min(p.h, (cy + R).toInt() + 1))
+            for (x in max(0, (cx - R).toInt()) until min(p.w, (cx + R).toInt() + 1)) {
+                val d = sqrt(sq(x - cx) + sq(y - cy)) / R
+                val i = y * p.w + x
+                if (d <= 0.85) {
+                    nDisk++; ds += p.D[i]
+                    val l = p.L[i].toDouble(); sumL += l; sumL2 += l * l
+                }
+                if (d <= 0.55) { nInner++; if (p.D[i] > 18f) solidIn++ }
+            }
+        if (nDisk == 0 || nInner == 0) return true
+        ds.sort()
+        val dmed = ds[ds.size / 2]
+        val mean = sumL / nDisk
+        val lstd = sqrt(max(0.0, sumL2 / nDisk - mean * mean))
+        val sIn = solidIn.toDouble() / nInner
+        if (lstd < 26 && dmed < 60f) return true
+        if (sIn < 0.7 && lstd < 32) return true
+        if (sIn < 0.5 && dmed < 14f) return true
+        return false
     }
 
     class BallStats(val white: Double, val whiteOuter: Double, val blackOuter: Double, val colour: Double)
@@ -359,73 +389,145 @@ class BallVision {
             img[i + p.w] * (1 - fx) * fy + img[i + p.w + 1] * fx * fy
     }
 
+    private class Run(val len: Double, val mean: Double, val start: Double, val end: Double)
+
+    /** Longest run of samples above [thr] along a ray (short gaps allowed) that starts within [maxStart]. */
+    private fun rayRun(img: FloatArray, p: Prep, cx: Double, cy: Double, ang: Double, thr: Double, r0: Double, r1: Double,
+                    step: Double, maxGap: Int, maxStart: Double): Run {
+        val ux = cos(ang); val uy = sin(ang)
+        val n = ((r1 - r0) / step).toInt() + 1
+        var best = Run(0.0, 0.0, 0.0, 0.0)
+        var curS = -1.0; var gap = 0; var sum = 0.0; var cnt = 0; var lastHi = -1.0
+        for (i in 0 until n) {
+            val d = r0 + i * step
+            val x = cx + ux * d; val y = cy + uy * d
+            if (x < 0 || y < 0 || x >= p.w - 1 || y >= p.h - 1) break
+            val v = bilinear(img, p, x, y)
+            if (v > thr) {
+                if (curS < 0) { if (d > maxStart) break; curS = d; sum = 0.0; cnt = 0 }
+                sum += v; cnt++; lastHi = d; gap = 0
+            } else if (curS >= 0) {
+                gap++
+                if (gap > maxGap) {
+                    val l = lastHi - curS
+                    if (l > best.len) best = Run(l, sum / cnt, curS, lastHi)
+                    curS = -1.0
+                    if (d > maxStart) break
+                }
+            }
+        }
+        if (curS >= 0 && lastHi >= 0) {
+            val l = lastHi - curS
+            if (l > best.len) best = Run(l, sum / max(1, cnt), curS, lastHi)
+        }
+        return best
+    }
+
+    private fun morphOpen(a: FloatArray, w: Int, h: Int): FloatArray {
+        val m = toMat(a, w, h); val d = Mat()
+        Imgproc.morphologyEx(m, d, Imgproc.MORPH_OPEN, Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0)))
+        val r = toArr(d); m.release(); d.release(); return r
+    }
+
+    /**
+     * Shot direction from the cue stick (a bar behind the cue ball) and/or the game's aim line (a thin line in
+     * front). Both are scored together for every direction so the result cannot flip; the best candidates are
+     * checked (a stick has a steady width, a row of balls does not; a thin white bar is really the aim line);
+     * then the angle is refined with one line fit through both.
+     */
     fun detectStick(p: Prep, cue: Vec): StickReading? {
         val R = TARGET_R
         val c = p.toLocal(cue)
         val cx = c.x; val cy = c.y
-        fun gblur(a: FloatArray, k: Int, sigma: Double): FloatArray {
-            val m = toMat(a, p.w, p.h); val d = Mat()
-            Imgproc.GaussianBlur(m, d, Size(k.toDouble(), k.toDouble()), sigma)
-            val r = toArr(d); m.release(); d.release(); return r
+        val w = p.w; val h = p.h
+        val thick = morphOpen(p.D, w, h)
+        val lp = FloatArray(w * h) { max(p.L[it] - p.Lbg[it], 0f) }
+        val lpo = morphOpen(lp, w, h)
+        val thinRaw = FloatArray(w * h) { max(lp[it] - lpo[it], 0f) }
+        val thin = run {
+            val m = toMat(thinRaw, w, h); val d = Mat()
+            Imgproc.GaussianBlur(m, d, Size(3.0, 3.0), 0.6)
+            val r = toArr(d); m.release(); d.release(); r
         }
-        val db = gblur(p.D, 5, 1.0)
-        val lw = gblur(FloatArray(p.w * p.h) { max(p.L[it] - p.Lbg[it], 0f) }, 3, 0.8)
+        val step = R * 0.25
 
-        fun ray(img: FloatArray, ang: Double, r0: Double, r1: Double, n: Int = 40): Double {
-            val ux = cos(ang); val uy = sin(ang)
-            val vals = ArrayList<Double>(n)
-            for (i in 0 until n) {
-                val d = r0 + (r1 - r0) * i / (n - 1)
-                val x = cx + ux * d; val y = cy + uy * d
-                if (x < 0 || y < 0 || x >= p.w || y >= p.h) break
-                vals += bilinear(img, p, x, y)
-            }
-            if (vals.size < n / 3) return 0.0
-            vals.sort()
-            return vals[vals.size / 4] // lower quartile: the WHOLE ray must be stick/line, not one ball
+        class C(val phi: Double, val s: Run, val l: Run) {
+            val hasS get() = s.len >= 3 * R
+            val hasL get() = l.len >= 2.5 * R
+            val score get() = (if (hasS) s.len / R * min(s.mean / 40, 1.5) else 0.0) +
+                1.3 * (if (hasL) l.len / R * min(l.mean / 25, 1.5) else 0.0)
         }
-
-        var bestScore = 0.0; var bestAng = 0.0; var found = false
+        val cands = ArrayList<C>(720)
         for (i in 0 until 720) {
-            val ang = 2 * PI * i / 720
-            val st = ray(db, ang, R * 1.6, R * 9)
-            val ln = ray(lw, ang, R * 1.4, R * 7) * 1.2
-            if (st > bestScore) { bestScore = st; bestAng = ang; found = true }
-            if (ln > bestScore) { bestScore = ln; bestAng = ang; found = true }
+            val phi = 2 * PI * i / 720
+            val s = rayRun(thick, p, cx, cy, phi + PI, 14.0, R * 1.15, R * 18, step, 1, R * 7)
+            val l = rayRun(thin, p, cx, cy, phi, 8.0, R * 1.0, R * 18, step, 3, R * 2.2)
+            cands += C(phi, s, l)
         }
-        if (!found || bestScore < 12) return null
-        var ang = bestAng
-        val ux = cos(ang); val uy = sin(ang)
+        cands.sortByDescending { it.score }
 
-        // Thick bar = cue stick (shot goes the opposite way); thin line = the game's aim line.
-        val widths = ArrayList<Double>()
-        for (k in 0 until 10) {
-            val dist = R * (2.2 + (9 - 2.2) * k / 9)
-            val px = cx + ux * dist; val py = cy + uy * dist
-            if (px < 0 || py < 0 || px >= p.w || py >= p.h) continue
-            val prof = DoubleArray(51) { j -> val o = (-1.0 + 0.04 * j) * R; bilinear(p.D, p, px - uy * o, py + ux * o) }
-            val mx = prof.maxOrNull() ?: 0.0
-            if (mx > 0) widths += prof.count { it > mx * 0.5 } * 0.04
+        var phi = 0.0
+        var sRange: Pair<Double, Double>? = null
+        var lRange: Pair<Double, Double>? = null
+        var reinterpret = false
+        var found = false
+        val tried = ArrayList<Double>()
+        for (cand in cands) {
+            if (tried.size >= 8 || cand.score <= 0) break
+            if (tried.any { abs(angleDiff(it, cand.phi)) < Math.toRadians(3.0) }) continue
+            tried += cand.phi
+            var sr = if (cand.hasS) cand.s.start to cand.s.end else null
+            var lr = if (cand.hasL) cand.l.start to cand.l.end else null
+            var re = false
+            if (sr != null) {
+                val prof = barProfile(p, cx, cy, cand.phi + PI, sr.first, sr.second)
+                if (prof.widths.isEmpty()) sr = null else {
+                    val ws = prof.widths.sorted()
+                    fun pct(q: Double) = ws[((ws.size - 1) * q).roundToInt()]
+                    val w30 = pct(0.3); val w50 = pct(0.5); val w70 = pct(0.7)
+                    val whitish = prof.ls.isNotEmpty() && prof.ls.sorted()[prof.ls.size / 2] > 185 &&
+                        prof.cs.sorted()[prof.cs.size / 2] < 30
+                    when {
+                        w50 > 0.95 || (w70 - w30) > 0.35 -> sr = null          // a row of balls, not a stick
+                        w30 < 0.42 && whitish && lr == null -> re = true         // thin white bar = aim line
+                        w30 < 0.2 -> re = lr == null
+                    }
+                }
+            }
+            var ph = cand.phi
+            if (re) { ph = (ph + PI) % (2 * PI); lr = sr; sr = null }
+            if (sr == null && lr == null) continue
+            phi = ph; sRange = sr; lRange = lr; reinterpret = re; found = true
+            break
         }
-        val isStick = widths.isNotEmpty() && widths.sorted()[widths.size / 2] > 0.25
+        if (!found) return null
 
-        // Sub-pixel refinement: centroid of the cross profile at many distances + robust line fit.
-        val img = if (isStick) p.D else lw
-        val r0 = if (isStick) R * 2.0 else R * 1.6
-        val r1 = if (isStick) R * 12 else R * 9
+        // Joint sub-pixel line fit: stick points behind (negative distance), line points in front.
+        val ux = cos(phi); val uy = sin(phi)
         val ds = ArrayList<Double>(); val os = ArrayList<Double>()
-        for (i in 0 until 40) {
-            val dist = r0 + (r1 - r0) * i / 39
-            val px = cx + ux * dist; val py = cy + uy * dist
-            if (px < R || py < R || px >= p.w - R || py >= p.h - R) break
-            val offs = DoubleArray(41) { (-0.6 + 0.03 * it) * R }
-            val prof = DoubleArray(41) { bilinear(img, p, px - uy * offs[it], py + ux * offs[it]) }
-            val mx = prof.maxOrNull() ?: 0.0
-            if (mx <= 8) continue
-            var sw = 0.0; var so = 0.0
-            for (j in offs.indices) { val wgt = max(prof[j] - mx * 0.5, 0.0); sw += wgt; so += wgt * offs[j] }
-            if (sw > 0) { ds += dist; os += so / sw }
+        fun collect(img: FloatArray, a: Double, b: Double, sign: Double) {
+            var d = a
+            while (d < b) {
+                val px = cx + ux * d * sign; val py = cy + uy * d * sign
+                val offs = DoubleArray(41) { (-0.6 + 0.03 * it) * R }
+                var ok = true
+                val prof = DoubleArray(41) {
+                    val x = px - uy * offs[it]; val y = py + ux * offs[it]
+                    if (x < 0 || y < 0 || x >= w - 1 || y >= h - 1) { ok = false; 0.0 } else bilinear(img, p, x, y)
+                }
+                if (ok) {
+                    val mx = prof.maxOrNull() ?: 0.0
+                    if (mx > 6) {
+                        var sw = 0.0; var so = 0.0
+                        for (j in offs.indices) { val wg = max(prof[j] - mx * 0.5, 0.0); sw += wg; so += wg * offs[j] }
+                        if (sw > 0) { ds += d * sign; os += so / sw }
+                    }
+                }
+                d += R * 0.25
+            }
         }
+        sRange?.let { collect(thick, it.first, it.second, -1.0) }
+        lRange?.let { collect(if (reinterpret) p.D else thin, it.first, it.second, 1.0) }
         if (ds.size >= 6) {
             var d = ds.toDoubleArray(); var o = os.toDoubleArray()
             repeat(2) {
@@ -435,13 +537,47 @@ class BallVision {
                 val keep = res.indices.filter { res[it] <= cut }
                 d = DoubleArray(keep.size) { d[keep[it]] }; o = DoubleArray(keep.size) { o[keep[it]] }
             }
-            if (d.size >= 3) {
-                val (_, b) = lineFit(d, o)
-                ang += atan(b)
-            }
+            if (d.size >= 3) phi += atan(lineFit(d, o).second)
         }
-        val shot = if (isStick) ang + PI else ang
-        return StickReading(((shot % (2 * PI)) + 2 * PI) % (2 * PI), isStick)
+        return StickReading(((phi % (2 * PI)) + 2 * PI) % (2 * PI), sRange != null)
+    }
+
+    private class BarProfile(val widths: List<Double>, val ls: List<Double>, val cs: List<Double>)
+
+    /** Width (in ball radii) and centre colour of a bar along a ray between distances a and b. */
+    private fun barProfile(p: Prep, cx: Double, cy: Double, ang: Double, a: Double, b: Double): BarProfile {
+        val R = TARGET_R
+        val ux = cos(ang); val uy = sin(ang)
+        val widths = ArrayList<Double>(); val ls = ArrayList<Double>(); val cs = ArrayList<Double>()
+        for (k in 0 until 12) {
+            val d = a + (b - a) * k / 11
+            val px = cx + ux * d; val py = cy + uy * d
+            val n = 101
+            var ok = true
+            val offs = DoubleArray(n) { (-1.0 + 0.02 * it) * R }
+            val prof = DoubleArray(n) {
+                val x = px - uy * offs[it]; val y = py + ux * offs[it]
+                if (x < 0 || y < 0 || x >= p.w - 1 || y >= p.h - 1) { ok = false; 0.0 } else bilinear(p.D, p, x, y)
+            }
+            if (!ok) continue
+            val mx = prof.maxOrNull() ?: 0.0
+            if (mx <= 0) continue
+            widths += prof.count { it > mx * 0.5 } * 0.02
+            var bi = 0
+            for (j in prof.indices) if (prof[j] > prof[bi]) bi = j
+            val x = px - uy * offs[bi]; val y = py + ux * offs[bi]
+            ls += bilinear(p.L, p, x, y)
+            val aa = bilinear(p.A, p, x, y); val bb = bilinear(p.B, p, x, y)
+            cs += sqrt(aa * aa + bb * bb)
+        }
+        return BarProfile(widths, ls, cs)
+    }
+
+    private fun angleDiff(a: Double, b: Double): Double {
+        var d = (a - b) % (2 * PI)
+        if (d > PI) d -= 2 * PI
+        if (d < -PI) d += 2 * PI
+        return d
     }
 
     /** Least squares o = a + b*d. */

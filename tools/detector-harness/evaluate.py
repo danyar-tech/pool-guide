@@ -2,7 +2,7 @@ import math
 import sys
 import time
 
-from detect import Prep, assign_kinds, classify, detect_stick, detect_v1, detect_v2, TARGET_R
+from detect import Prep, assign_kinds, classify, detect_stick2 as detect_stick, detect_v1, detect_v2, TARGET_R
 from gen import make_scene
 
 KIND = lambda bid: "cue" if bid == 0 else "eight" if bid == 8 else "solid" if bid < 8 else "stripe"

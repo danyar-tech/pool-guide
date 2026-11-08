@@ -173,6 +173,8 @@ class MainActivity : Activity() {
         root.addView(slider("Ball radius: %.0f px (0 = automatic; easier: orange ring in Edit)", 0, 80, prefs.ballRadius.toInt()) { v ->
             prefs.ballRadius = v.toFloat(); v.toFloat()
         })
+        root.addView(slider("Pocket size: %.0f%% (match the red jaw marks in Edit to the game's pockets)", 50, 180,
+            (prefs.pocketScale * 100).toInt()) { v -> prefs.pocketScale = v / 100f; v.toFloat() })
         root.addView(check("Lock table position (stop re-detecting it on Scan)", prefs.lockTable) { prefs.lockTable = it })
         root.addView(check("Hide guide lines for a moment while capturing (recommended)", prefs.hideOnCapture) {
             prefs.hideOnCapture = it
@@ -189,12 +191,13 @@ class MainActivity : Activity() {
             "Live — keep scanning automatically\n" +
             "Scan — detect the balls now\n" +
             "Best shot / Predict — suggest the easiest pot, or trace the shot your stick is aiming at\n" +
+            "Target — tap it, then tap a ball: Best shot plans only for that ball (tap again for Auto)\n" +
             "Next — cycle through other good shots (Best shot mode)\n" +
             "Any/Solids/Stripes — which balls are yours\n" +
             "Cue: Auto/Man — detect the cue ball or place it yourself (Edit → Place cue)\n" +
             "Stick: Auto/Man — read the stick direction from the game, or set it yourself " +
             "(Edit → Aim to drag it, ◀ ▶ to fine-tune: tap = 0.05°, hold = faster)\n" +
-            "Edit — set the table and ball size, drag/add/delete balls, mark the cue ball, change a ball's type, " +
+            "Edit — set the table and ball size, adjust the pocket mouths (Pockets −/+ until the red jaw marks sit on the game's cushion ends), drag/add/delete balls, mark the cue ball, change a ball's type, " +
             "or tap a ball/pocket to force that shot\n" +
             "Hide — hide the lines\n" +
             "Tap the ⠿ title to collapse the panel, drag it to move it. Keep it off the table.\n\n" +

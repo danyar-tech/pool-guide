@@ -22,6 +22,8 @@ data class Prediction(
     val cutDeg: Double,
     /** Suggested power fraction when the object ball is potted, otherwise -1. */
     val power: Double,
+    /** The object ball is heading into a pocket but clips the jaw (rattles out). */
+    val objectJaw: Boolean = false,
 )
 
 /**
@@ -30,7 +32,7 @@ data class Prediction(
  */
 class Predictor(private val cfg: PlannerConfig) {
 
-    private class Trace(val points: List<Vec>, val hit: Ball?, val pocket: Int, val endDir: Vec)
+    private class Trace(val points: List<Vec>, val hit: Ball?, val pocket: Int, val endDir: Vec, val jaw: Boolean = false)
 
     fun predict(scene: Scene, cueId: Int, start: Vec, dir: Vec): Prediction {
         val r = scene.ballRadius
@@ -68,7 +70,7 @@ class Predictor(private val cfg: PlannerConfig) {
             }
         }
         return Prediction(cue.points, target.id, contact, obj.points, obj.pocket, obj.hit?.id ?: -1,
-            after, scratch, Math.toDegrees(cut), power)
+            after, scratch, Math.toDegrees(cut), power, obj.jaw)
     }
 
     private fun legs(pts: List<Vec>) = (1 until pts.size).map { pts[it - 1].dist(pts[it]) }.filter { it > 1e-6 }
@@ -104,25 +106,36 @@ class Predictor(private val cfg: PlannerConfig) {
             if (d.y > 1e-9) { val t = (scene.maxY() - pos.y) / d.y; if (t < tRail) { tRail = t; vertical = false } }
             if (d.y < -1e-9) { val t = (scene.minY() - pos.y) / d.y; if (t < tRail) { tRail = t; vertical = false } }
             tRail = max(tRail, 0.0)
-            val tNext = min(tBall, tRail)
-            // pocket: ball centre passes inside the pocket mouth before the next event
+            // Pockets: the centre line must pass between the two jaws with a radius of clearance.
             var tPocket = Double.MAX_VALUE
             var pocketIdx = -1
-            val capture = max(tb.pocketRadius * 0.95, r * 1.1)
-            tb.pockets.forEachIndexed { i, pk ->
-                val m = pk.pos - pos
-                val tc = clampD(m.dot(d), 0.0, tNext)
-                val closest = pos + d * tc
-                if (closest.dist(pk.pos) < capture) {
-                    // entry point into the capture circle
-                    val off = (pk.pos - pos)
-                    val along = off.dot(d)
-                    val perp2 = off.dot(off) - along * along
-                    val tin = max(0.0, along - sqrt(max(0.0, capture * capture - perp2)))
-                    if (tin < tPocket) { tPocket = tin; pocketIdx = i }
+            var tJaw = Double.MAX_VALUE
+            for (i in tb.pockets.indices) {
+                val (ja, jb) = PocketGeom.jaws(tb, i, r, cfg.pocketScale)
+                val cl = PocketGeom.clearance(pos, d, ja, jb, r) ?: continue
+                val tm = PocketGeom.distanceToMouth(pos, d, ja, jb)
+                if (tm <= 0 || tm == Double.MAX_VALUE) continue
+                // the mouth must be right where this path reaches the cushion line, not past another cushion
+                if (tm > tRail + 4.5 * r) continue
+                if (cl >= -0.02 * r) {
+                    if (tm < tPocket) { tPocket = tm; pocketIdx = i }
+                } else {
+                    // between the jaws but too tight: it hits a jaw just before the mouth
+                    val tj = max(0.0, tm - r)
+                    if (tj < tJaw) tJaw = tj
                 }
             }
-            val t = minOf(tBall, tRail, tPocket)
+            if (pocketIdx >= 0 && tPocket < tBall) {
+                // Going in: the cushion line is open here, so ignore the rail crossing at the mouth.
+                if (tPocket >= remaining) { pts += pos + d * remaining; return Trace(pts, null, -1, d) }
+                pts += pos + d * (tPocket + r * 1.3)
+                return Trace(pts, null, pocketIdx, d)
+            }
+            if (tJaw < tBall && tJaw <= tRail + r * 2 && tJaw < remaining) {
+                pts += pos + d * min(tJaw, tRail)
+                return Trace(pts, null, -1, d, jaw = true)
+            }
+            val t = minOf(tBall, tRail)
             if (t >= remaining) {
                 pts += pos + d * remaining
                 return Trace(pts, null, -1, d)
@@ -131,7 +144,6 @@ class Predictor(private val cfg: PlannerConfig) {
             pts += pos
             remaining -= t
             when {
-                t == tPocket -> return Trace(pts, null, pocketIdx, d)
                 t == tBall -> return Trace(pts, hit, -1, d)
                 else -> {
                     rails++

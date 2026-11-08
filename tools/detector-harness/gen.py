@@ -53,7 +53,11 @@ def shade_disk(img, cx, cy, r, base, stripe=False, number=None, angle=0.0, outli
                     cv2.FONT_HERSHEY_SIMPLEX, fs, (20, 20, 20), max(1, int(r / 18)), cv2.LINE_AA)
 
 
+INFO = {}
+
+
 def make_scene(seed, w=2400, h=1080):
+    INFO.clear()
     rng = random.Random(seed)
     img = np.zeros((h, w, 3), np.uint8)
     # background UI: dark gradient + some panels
@@ -148,6 +152,34 @@ def make_scene(seed, w=2400, h=1080):
                 continue
             placed.append((x, y, bid))
 
+    # felt logos and markings (must never be detected as balls)
+    lighter = tuple(int(min(255, c * 1.35 + 12)) for c in felt)
+    darker = tuple(int(c * 0.75) for c in felt)
+    if rng.random() < 0.6:
+        cxl, cyl = (left + right) / 2 + rng.uniform(-tw * 0.2, tw * 0.2), (top + bottom) / 2 + rng.uniform(-th * 0.2, th * 0.2)
+        rad = r * rng.uniform(2.0, 4.5)
+        col = rng.choice([lighter, darker, (200, 170, 60)])
+        lay = img.copy()
+        cv2.circle(lay, (int(cxl), int(cyl)), int(rad), col, max(2, int(r * 0.12)), cv2.LINE_AA)
+        cv2.putText(lay, rng.choice(["POOL", "8", "PRO", "CLUB"]), (int(cxl - rad * 0.6), int(cyl + rad * 0.2)),
+                    cv2.FONT_HERSHEY_SIMPLEX, rad / 45, col, max(1, int(r / 10)), cv2.LINE_AA)
+        img = cv2.addWeighted(img, 0.45, lay, 0.55, 0)
+    if rng.random() < 0.35:
+        # small ball-sized emblem
+        cxl, cyl = rng.uniform(left + 3 * r, right - 3 * r), rng.uniform(top + 3 * r, bottom - 3 * r)
+        if all(math.hypot(cxl - a, cyl - b) > 3 * r for a, b, _ in placed):
+            lay = img.copy()
+            col = rng.choice([lighter, darker, (200, 170, 60)])
+            cv2.circle(lay, (int(cxl), int(cyl)), int(r * rng.uniform(0.8, 1.2)), col, max(2, int(r * 0.1)), cv2.LINE_AA)
+            cv2.putText(lay, "8", (int(cxl - r * 0.3), int(cyl + r * 0.35)), cv2.FONT_HERSHEY_SIMPLEX, r / 30, col, 2, cv2.LINE_AA)
+            img = cv2.addWeighted(img, 0.5, lay, 0.5, 0)
+    if rng.random() < 0.5:
+        cv2.circle(img, (int(left + tw * 0.25), int((top + bottom) / 2)), max(2, int(r * 0.18)), (235, 235, 235), -1, cv2.LINE_AA)
+        cv2.circle(img, (int(left + tw * 0.75), int((top + bottom) / 2)), max(2, int(r * 0.18)), (235, 235, 235), -1, cv2.LINE_AA)
+    if rng.random() < 0.4:
+        cv2.putText(img, rng.choice(["8 BALL", "LEAGUE", "BILLIARDS"]), (int(left + tw * 0.06), int(bottom - th * 0.08)),
+                    cv2.FONT_HERSHEY_SIMPLEX, r / 22, lighter, 2, cv2.LINE_AA)
+
     # shadows first
     sh = img.copy()
     for (x, y, _) in placed:
@@ -166,28 +198,68 @@ def make_scene(seed, w=2400, h=1080):
             shade_disk(img, x, y, r, BALL_COLORS[bid - 9], stripe=True, number=bid if numbers else None,
                        angle=rng.uniform(0, math.pi), outline=outline)
 
-    # game's own aim line + cue stick (distractors)
+    # game's own guidelines + cue stick (distractors)
     cue = [p for p in placed if p[2] == 0]
     stick = None
-    if cue and rng.random() < 0.6:
+    if cue and rng.random() < 0.75:
         cx, cy, _ = cue[0]
         ang = rng.uniform(0, 2 * math.pi)
         dx, dy = math.cos(ang), math.sin(ang)
-        L = rng.uniform(200, 600)
-        cv2.line(img, (int(cx + dx * r * 1.1), int(cy + dy * r * 1.1)), (int(cx + dx * L), int(cy + dy * L)),
-                 (240, 240, 240), 2, cv2.LINE_AA)
-        cv2.circle(img, (int(cx + dx * L), int(cy + dy * L)), int(r), (240, 240, 240), 2, cv2.LINE_AA)
-        # stick on the other side
-        g = r * rng.uniform(0.3, 1.5)
-        s0 = (cx - dx * (r + g), cy - dy * (r + g))
-        s1 = (cx - dx * (r + g + 900), cy - dy * (r + g + 900))
-        cv2.line(img, (int(s0[0]), int(s0[1])), (int(s1[0]), int(s1[1])), (205, 160, 100), int(r * 0.45), cv2.LINE_AA)
-        cv2.line(img, (int(s0[0]), int(s0[1])), (int(s0[0] - dx * r), int(s0[1] - dy * r)), (240, 240, 230),
-                 int(r * 0.45), cv2.LINE_AA)
+        Lg = rng.uniform(4 * r, 25 * r)
+        lw = rng.choice([1, 2, 2, 3])
+        col = rng.choice([(240, 240, 240), (255, 255, 255), (220, 230, 255), (255, 250, 200)])
+        over = img.copy()
+        style = rng.choice(["solid", "solid", "dashed", "dotted"])
+        if rng.random() < 0.9:
+            p0 = (cx + dx * r * 1.05, cy + dy * r * 1.05)
+            total = Lg - r * 1.05
+            if style == "solid":
+                cv2.line(over, (int(p0[0]), int(p0[1])), (int(cx + dx * Lg), int(cy + dy * Lg)), col, lw, cv2.LINE_AA)
+            else:
+                seg = r * (0.6 if style == "dashed" else 0.15)
+                gap = r * (0.4 if style == "dashed" else 0.3)
+                t = 0.0
+                while t < total:
+                    a = (p0[0] + dx * t, p0[1] + dy * t); b = (p0[0] + dx * min(t + seg, total), p0[1] + dy * min(t + seg, total))
+                    cv2.line(over, (int(a[0]), int(a[1])), (int(b[0]), int(b[1])), col, lw, cv2.LINE_AA)
+                    t += seg + gap
+            gx, gy = cx + dx * Lg, cy + dy * Lg
+            end = rng.choice(["ring", "ring", "thick", "filled", "none"])
+            if end == "ring":
+                cv2.circle(over, (int(gx), int(gy)), int(r), col, lw, cv2.LINE_AA)
+            elif end == "thick":
+                cv2.circle(over, (int(gx), int(gy)), int(r * 0.92), col, max(2, int(r * 0.15)), cv2.LINE_AA)
+            elif end == "filled":
+                f2 = over.copy()
+                cv2.circle(f2, (int(gx), int(gy)), int(r), col, -1, cv2.LINE_AA)
+                over = cv2.addWeighted(over, 1 - rng.uniform(0.2, 0.45), f2, 0, 0) if False else cv2.addWeighted(over, 0.65, f2, 0.35, 0)
+                cv2.circle(over, (int(gx), int(gy)), int(r), col, lw, cv2.LINE_AA)
+            # object ball direction hint + cue ball deflection hint from the ghost position
+            if end != "none" and rng.random() < 0.7:
+                for _ in range(rng.randint(1, 2)):
+                    a2 = rng.uniform(0, 2 * math.pi); L2 = rng.uniform(2 * r, 6 * r)
+                    cv2.line(over, (int(gx + math.cos(a2) * r), int(gy + math.sin(a2) * r)),
+                             (int(gx + math.cos(a2) * (r + L2)), int(gy + math.sin(a2) * (r + L2))), col, lw, cv2.LINE_AA)
+        alpha = rng.uniform(0.55, 1.0)
+        img = cv2.addWeighted(img, 1 - alpha, over, alpha, 0)
+        INFO['line_w'] = lw; INFO['style'] = style; INFO['stick'] = False
+        if rng.random() < 0.85:
+            INFO['stick'] = True
+            # stick on the other side, pulled back by a random amount (power)
+            g = r * rng.choice([rng.uniform(0.2, 1.0), rng.uniform(1.0, 5.0)])
+            sw = max(3, int(r * rng.uniform(0.3, 0.55)))
+            scol = rng.choice([(205, 160, 100), (180, 120, 60), (30, 30, 30), (230, 200, 120), (120, 60, 30)])
+            s0 = (cx - dx * (r + g), cy - dy * (r + g))
+            s1 = (cx - dx * (r + g + 1100), cy - dy * (r + g + 1100))
+            cv2.line(img, (int(s0[0]), int(s0[1])), (int(s1[0]), int(s1[1])), scol, sw, cv2.LINE_AA)
+            cv2.line(img, (int(s0[0]), int(s0[1])), (int(s0[0] - dx * r * 0.6), int(s0[1] - dy * r * 0.6)),
+                     (240, 240, 230), sw, cv2.LINE_AA)
         stick = ang
     img = cv2.GaussianBlur(img, (3, 3), 0.7)
     truth = [(x, y, bid) for (x, y, bid) in placed]
-    table = dict(left=left, top=top, right=right, bottom=bottom, pockets=pockets, pr=pr)
+    j = lambda: rng.uniform(-0.3, 0.3) * r
+    table = dict(left=int(left + j()), top=int(top + j()), right=int(right + j()), bottom=int(bottom + j()),
+                 pockets=pockets, pr=pr)
     return img, truth, table, r, stick
 
 
